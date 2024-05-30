@@ -19,8 +19,15 @@ jobs:
                   username: ${{ secrets.DOCKERHUB_USERNAME }}
                   password: ${{ secrets.DOCKERHUB_PASS }}
 
+            - name: Get core numbers
+              run: echo "NPROC=$(nproc)" >> $GITHUB_ENV
+
+
             - name: Build and push Docker image 
               uses: docker/build-push-action@v3
               with:
                   push: true
                   tags: beclab/kvrocks:${{ github.event.inputs.tags }}
+                  build-args: |
+                    MORE_BUILD_ARGS=-j${{ env.NPROC }}
+      

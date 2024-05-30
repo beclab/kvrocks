@@ -88,7 +88,7 @@ class CommandXAdd : public Commander {
 
         size_t max_len_idx = 0;
         bool eq_sign_found = false;
-        if (args[i + 1] == "=") {
+        if (args[i + 1] == "=" || args[i + 1] == "~") {
           max_len_idx = i + 2;
           eq_sign_found = true;
         } else {
@@ -118,7 +118,7 @@ class CommandXAdd : public Commander {
 
         size_t min_id_idx = 0;
         bool eq_sign_found = false;
-        if (args[i + 1] == "=") {
+        if (args[i + 1] == "=" || args[i + 1] == "~") {
           min_id_idx = i + 2;
           eq_sign_found = true;
         } else {
