@@ -67,7 +67,10 @@ rocksdb::Status String::getRawValue(const std::string &ns_key, std::string *raw_
 
   Metadata metadata(kRedisNone, false);
   Slice slice = *raw_value;
-  return ParseMetadata({kRedisString}, &slice, &metadata);
+  s = ParseMetadata({kRedisString}, &slice, &metadata);
+  if (s.IsNotFound()) raw_value->clear();
+
+  return s;
 }
 
 rocksdb::Status String::getValueAndExpire(const std::string &ns_key, std::string *value, uint64_t *expire) {
