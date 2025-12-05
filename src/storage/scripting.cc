@@ -42,11 +42,14 @@
 #include "server/server.h"
 #include "sha1.h"
 #include "storage/storage.h"
+#include "string_util.h"
 
 /* The maximum number of characters needed to represent a long double
  * as a string (long double has a huge range).
  * This should be the size of the buffer given to doule to string */
 constexpr size_t MAX_LONG_DOUBLE_CHARS = 5 * 1024;
+
+constexpr int64_t LUA_GC_CYCLE_PERIOD = 50;
 
 enum {
   LL_DEBUG = 0,
@@ -57,14 +60,11 @@ enum {
 
 namespace lua {
 
-lua_State *CreateState(Server *srv, bool read_only) {
+lua_State *CreateState() {
   lua_State *lua = lua_open();
   LoadLibraries(lua);
   RemoveUnsupportedFunctions(lua);
-  LoadFuncs(lua, read_only);
-
-  lua_pushlightuserdata(lua, srv);
-  lua_setglobal(lua, REDIS_LUA_SERVER_PTR);
+  LoadFuncs(lua);
 
   EnableGlobalsProtection(lua);
   return lua;
@@ -75,7 +75,7 @@ void DestroyState(lua_State *lua) {
   lua_close(lua);
 }
 
-void LoadFuncs(lua_State *lua, bool read_only) {
+void LoadFuncs(lua_State *lua) {
   lua_newtable(lua);
 
   /* redis.call */
@@ -125,11 +125,6 @@ void LoadFuncs(lua_State *lua, bool read_only) {
   lua_settable(lua, -3);
   lua_pushstring(lua, "status_reply");
   lua_pushcfunction(lua, RedisStatusReplyCommand);
-  lua_settable(lua, -3);
-
-  /* redis.read_only */
-  lua_pushstring(lua, "read_only");
-  lua_pushboolean(lua, read_only);
   lua_settable(lua, -3);
 
   /* redis.register_function */
@@ -214,10 +209,10 @@ int RedisLogCommand(lua_State *lua) {
   switch (level) {
     case LL_VERBOSE:  // also regard VERBOSE as INFO here since no VERBOSE level
     case LL_NOTICE:
-      LOG(INFO) << "[Lua] " << log_message;
+      info("[Lua] {}", log_message);
       break;
     case LL_WARNING:
-      LOG(WARNING) << "[Lua] " << log_message;
+      warn("[Lua] {}", log_message);
       break;
   }
   return 0;
@@ -226,8 +221,8 @@ int RedisLogCommand(lua_State *lua) {
 int RedisRegisterFunction(lua_State *lua) {
   int argc = lua_gettop(lua);
 
-  if (argc != 2) {
-    lua_pushstring(lua, "redis.register_function() requires two arguments.");
+  if (argc < 2 || argc > 3) {
+    lua_pushstring(lua, "wrong number of arguments to redis.register_function().");
     return lua_error(lua);
   }
 
@@ -243,6 +238,15 @@ int RedisRegisterFunction(lua_State *lua) {
 
   // set this function to global
   std::string name = lua_tostring(lua, 1);
+  if (argc == 3) {
+    auto flags = ExtractFlagsFromRegisterFunction(lua);
+    if (!flags) {
+      lua_pushstring(lua, flags.Msg().c_str());
+      return lua_error(lua);
+    }
+    lua_pushinteger(lua, static_cast<lua_Integer>(flags.GetValue()));
+    lua_setglobal(lua, (REDIS_LUA_REGISTER_FUNC_FLAGS_PREFIX + name).c_str());
+  }
   lua_setglobal(lua, (REDIS_LUA_REGISTER_FUNC_PREFIX + name).c_str());
 
   // set this function name to REDIS_FUNCTION_LIBRARIES[libname]
@@ -269,17 +273,19 @@ int RedisRegisterFunction(lua_State *lua) {
   }
 
   // store the map from function name to library name
-  auto s = GetServer(lua)->FunctionSetLib(name, libname);
+  auto *script_run_ctx = GetFromRegistry<ScriptRunCtx>(lua, REGISTRY_SCRIPT_RUN_CTX_NAME);
+  CHECK(script_run_ctx != nullptr);
+
+  auto s = script_run_ctx->conn->GetServer()->FunctionSetLib(name, libname);
   if (!s) {
     lua_pushstring(lua, "redis.register_function() failed to store informantion.");
     return lua_error(lua);
   }
-
   return 0;
 }
 
-Status FunctionLoad(redis::Connection *conn, const std::string &script, bool need_to_store, bool replace,
-                    std::string *lib_name, bool read_only) {
+Status FunctionLoad(redis::Connection *conn, engine::Context *ctx, const std::string &script, bool need_to_store,
+                    bool replace, [[maybe_unused]] std::string *lib_name) {
   std::string first_line, lua_code;
   if (auto pos = script.find('\n'); pos != std::string::npos) {
     first_line = script.substr(0, pos);
@@ -288,42 +294,29 @@ Status FunctionLoad(redis::Connection *conn, const std::string &script, bool nee
     return {Status::NotOK, "Expect a Shebang statement in the first line"};
   }
 
-  static constexpr const char *shebang_prefix = "#!lua";
-  static constexpr const char *shebang_libname_prefix = "name=";
+  const auto libname = GET_OR_RET(ExtractLibNameFromShebang(first_line));
 
-  auto first_line_split = util::Split(first_line, " \r\t");
-  if (first_line_split.empty() || first_line_split[0] != shebang_prefix) {
-    return {Status::NotOK, "Expect a Shebang statement in the first line, e.g. `#!lua name=mylib`"};
-  }
-
-  size_t libname_pos = 1;
-  for (; libname_pos < first_line_split.size(); ++libname_pos) {
-    if (util::HasPrefix(first_line_split[libname_pos], shebang_libname_prefix)) {
-      break;
-    }
-  }
-
-  if (libname_pos >= first_line_split.size()) {
-    return {Status::NotOK, "Expect library name in the Shebang statement, e.g. `#!lua name=mylib`"};
-  }
-
-  auto libname = first_line_split[libname_pos].substr(strlen(shebang_libname_prefix));
-  *lib_name = libname;
-  if (libname.empty() ||
-      std::any_of(libname.begin(), libname.end(), [](char v) { return !std::isalnum(v) && v != '_'; })) {
-    return {Status::NotOK, "Expect a valid library name in the Shebang statement"};
-  }
-  auto srv = conn->GetServer();
-  auto lua = read_only ? conn->Owner()->Lua() : srv->Lua();
-
-  if (FunctionIsLibExist(conn, libname, need_to_store, read_only)) {
+  if (FunctionIsLibExist(conn, ctx, libname, need_to_store)) {
     if (!replace) {
       return {Status::NotOK, "library already exists, please specify REPLACE to force load"};
     }
-
-    auto s = FunctionDelete(srv, libname);
+    auto s = FunctionDelete(*ctx, conn, libname);
     if (!s) return s;
   }
+
+  auto srv = conn->GetServer();
+  auto lua = conn->Owner()->Lua();
+
+  ScriptRunCtx script_run_ctx;
+  script_run_ctx.conn = conn;
+  script_run_ctx.ctx = ctx;
+  // in FunctionLoad(), the script MUST be read-only,
+  // because this function can be called multiple times
+  // for one script from multiple threads,
+  // and it is dangerous and unexpected to allow writes here.
+  script_run_ctx.flags = ScriptFlagType::kScriptNoWrites;
+
+  SaveOnRegistry(lua, REGISTRY_SCRIPT_RUN_CTX_NAME, &script_run_ctx);
 
   lua_pushstring(lua, libname.c_str());
   lua_setglobal(lua, REDIS_FUNCTION_LIBNAME);
@@ -351,16 +344,19 @@ Status FunctionLoad(redis::Connection *conn, const std::string &script, bool nee
     return {Status::NotOK, "Error while running new function lib: " + err_msg};
   }
 
-  if (!FunctionIsLibExist(conn, libname, false, read_only)) {
+  RemoveFromRegistry(lua, REGISTRY_SCRIPT_RUN_CTX_NAME);
+
+  if (!FunctionIsLibExist(conn, ctx, libname, false)) {
     return {Status::NotOK, "Please register some function in FUNCTION LOAD"};
   }
 
   return need_to_store ? srv->FunctionSetCode(libname, script) : Status::OK();
 }
 
-bool FunctionIsLibExist(redis::Connection *conn, const std::string &libname, bool need_check_storage, bool read_only) {
+bool FunctionIsLibExist(redis::Connection *conn, engine::Context *ctx, const std::string &libname,
+                        bool need_check_storage) {
   auto srv = conn->GetServer();
-  auto lua = read_only ? conn->Owner()->Lua() : srv->Lua();
+  auto lua = conn->Owner()->Lua();
 
   lua_getglobal(lua, REDIS_FUNCTION_LIBRARIES);
 
@@ -385,16 +381,17 @@ bool FunctionIsLibExist(redis::Connection *conn, const std::string &libname, boo
   if (!s) return false;
 
   std::string lib_name;
-  s = FunctionLoad(conn, code, false, false, &lib_name, read_only);
+  s = FunctionLoad(conn, ctx, code, false, false, &lib_name);
   return static_cast<bool>(s);
 }
 
 // FunctionCall will firstly find the function in the lua runtime,
 // if it is not found, it will try to load the library where the function is located from storage
-Status FunctionCall(redis::Connection *conn, const std::string &name, const std::vector<std::string> &keys,
-                    const std::vector<std::string> &argv, std::string *output, bool read_only) {
+Status FunctionCall(redis::Connection *conn, engine::Context *ctx, const std::string &name,
+                    const std::vector<std::string> &keys, const std::vector<std::string> &argv, std::string *output,
+                    bool read_only) {
   auto srv = conn->GetServer();
-  auto lua = read_only ? conn->Owner()->Lua() : srv->Lua();
+  auto lua = conn->Owner()->Lua();
 
   lua_getglobal(lua, "__redis__err__handler");
 
@@ -409,12 +406,28 @@ Status FunctionCall(redis::Connection *conn, const std::string &name, const std:
     std::string libcode;
     s = srv->FunctionGetCode(libname, &libcode);
     if (!s) return s;
-
-    s = FunctionLoad(conn, libcode, false, false, &libname, read_only);
+    s = FunctionLoad(conn, ctx, libcode, false, false, &libname);
     if (!s) return s;
 
     lua_getglobal(lua, (REDIS_LUA_REGISTER_FUNC_PREFIX + name).c_str());
   }
+
+  ScriptRunCtx script_run_ctx;
+  script_run_ctx.conn = conn;
+  script_run_ctx.ctx = ctx;
+  script_run_ctx.flags = read_only ? ScriptFlagType::kScriptNoWrites : 0;
+  lua_getglobal(lua, (REDIS_LUA_REGISTER_FUNC_FLAGS_PREFIX + name).c_str());
+  if (!lua_isnil(lua, -1)) {
+    // It should be ensured that the conversion is successful
+    auto function_flags = lua_tointeger(lua, -1);
+    script_run_ctx.flags |= function_flags;
+  }
+  lua_pop(lua, 1);
+
+  SaveOnRegistry(lua, REGISTRY_SCRIPT_RUN_CTX_NAME, &script_run_ctx);
+
+  // save keys on registry the to perform key touching check
+  SaveOnRegistry(lua, REGISTRY_KEYS_NAME, &keys);
 
   PushArray(lua, keys);
   PushArray(lua, argv);
@@ -427,29 +440,47 @@ Status FunctionCall(redis::Connection *conn, const std::string &name, const std:
     lua_pop(lua, 2);
   }
 
+  RemoveFromRegistry(lua, REGISTRY_KEYS_NAME);
+  RemoveFromRegistry(lua, REGISTRY_SCRIPT_RUN_CTX_NAME);
+
+  /* Call the Lua garbage collector from time to time to avoid a
+   * full cycle performed by Lua, which adds too latency.
+   *
+   * The call is performed every LUA_GC_CYCLE_PERIOD executed commands
+   * (and for LUA_GC_CYCLE_PERIOD collection steps) because calling it
+   * for every command uses too much CPU. */
+  static int64_t gc_count = 0;
+
+  gc_count++;
+  if (gc_count == LUA_GC_CYCLE_PERIOD) {
+    lua_gc(lua, LUA_GCSTEP, LUA_GC_CYCLE_PERIOD);
+    gc_count = 0;
+  }
   return Status::OK();
 }
 
 // list all library names and their code (enabled via `with_code`)
-Status FunctionList(Server *srv, const redis::Connection *conn, const std::string &libname, bool with_code,
-                    std::string *output) {
+Status FunctionList(Server *srv, const redis::Connection *conn, engine::Context &ctx, const std::string &libname,
+                    bool with_code, std::string *output) {
   std::string start_key = engine::kLuaLibCodePrefix + libname;
   std::string end_key = start_key;
   end_key.back()++;
 
-  rocksdb::ReadOptions read_options = srv->storage->DefaultScanOptions();
-  redis::LatestSnapShot ss(srv->storage);
-  read_options.snapshot = ss.GetSnapShot();
+  rocksdb::ReadOptions read_options = ctx.DefaultScanOptions();
   rocksdb::Slice upper_bound(end_key);
   read_options.iterate_upper_bound = &upper_bound;
 
   auto *cf = srv->storage->GetCFHandle(ColumnFamilyID::Propagate);
-  auto iter = util::UniqueIterator(srv->storage, read_options, cf);
+  auto iter = util::UniqueIterator(ctx, read_options, cf);
   std::vector<std::pair<std::string, std::string>> result;
   for (iter->Seek(start_key); iter->Valid(); iter->Next()) {
     Slice lib = iter->key();
     lib.remove_prefix(strlen(engine::kLuaLibCodePrefix));
     result.emplace_back(lib.ToString(), iter->value().ToString());
+  }
+
+  if (auto s = iter->status(); !s.ok()) {
+    return {Status::NotOK, s.ToString()};
   }
 
   output->append(redis::MultiLen(result.size()));
@@ -468,24 +499,27 @@ Status FunctionList(Server *srv, const redis::Connection *conn, const std::strin
 
 // extension to Redis Function
 // list all function names and their corresponding library names
-Status FunctionListFunc(Server *srv, const redis::Connection *conn, const std::string &funcname, std::string *output) {
+Status FunctionListFunc(Server *srv, const redis::Connection *conn, engine::Context &ctx, const std::string &funcname,
+                        std::string *output) {
   std::string start_key = engine::kLuaFuncLibPrefix + funcname;
   std::string end_key = start_key;
   end_key.back()++;
 
-  rocksdb::ReadOptions read_options = srv->storage->DefaultScanOptions();
-  redis::LatestSnapShot ss(srv->storage);
-  read_options.snapshot = ss.GetSnapShot();
+  rocksdb::ReadOptions read_options = ctx.DefaultScanOptions();
   rocksdb::Slice upper_bound(end_key);
   read_options.iterate_upper_bound = &upper_bound;
 
   auto *cf = srv->storage->GetCFHandle(ColumnFamilyID::Propagate);
-  auto iter = util::UniqueIterator(srv->storage, read_options, cf);
+  auto iter = util::UniqueIterator(ctx, read_options, cf);
   std::vector<std::pair<std::string, std::string>> result;
   for (iter->Seek(start_key); iter->Valid(); iter->Next()) {
     Slice func = iter->key();
     func.remove_prefix(strlen(engine::kLuaLibCodePrefix));
     result.emplace_back(func.ToString(), iter->value().ToString());
+  }
+
+  if (auto s = iter->status(); !s.ok()) {
+    return {Status::NotOK, s.ToString()};
   }
 
   output->append(redis::MultiLen(result.size()));
@@ -504,8 +538,8 @@ Status FunctionListFunc(Server *srv, const redis::Connection *conn, const std::s
 // list detailed informantion of a specific library
 // NOTE: it is required to load the library to lua runtime before listing (calling this function)
 // i.e. it will output nothing if the library is only in storage but not loaded
-Status FunctionListLib(Server *srv, const redis::Connection *conn, const std::string &libname, std::string *output) {
-  auto lua = srv->Lua();
+Status FunctionListLib(redis::Connection *conn, const std::string &libname, std::string *output) {
+  auto lua = conn->Owner()->Lua();
 
   lua_getglobal(lua, REDIS_FUNCTION_LIBRARIES);
   if (lua_isnil(lua, -1)) {
@@ -541,8 +575,13 @@ Status FunctionListLib(Server *srv, const redis::Connection *conn, const std::st
   return Status::OK();
 }
 
-Status FunctionDelete(Server *srv, const std::string &name) {
-  auto lua = srv->Lua();
+Status FunctionDelete(engine::Context &ctx, redis::Connection *conn, const std::string &name) {
+  auto lua = conn->Owner()->Lua();
+
+  // load the library into this lua state
+  if (!FunctionIsLibExist(conn, &ctx, name, true)) {
+    return {Status::NotOK, "the library does not exist in lua environment"};
+  }
 
   lua_getglobal(lua, REDIS_FUNCTION_LIBRARIES);
   if (lua_isnil(lua, -1)) {
@@ -556,35 +595,52 @@ Status FunctionDelete(Server *srv, const std::string &name) {
     return {Status::NotOK, "the library does not exist in lua environment"};
   }
 
-  auto storage = srv->storage;
+  auto storage = conn->GetServer()->storage;
   auto cf = storage->GetCFHandle(ColumnFamilyID::Propagate);
 
   for (size_t i = 1; i <= lua_objlen(lua, -1); ++i) {
     lua_rawgeti(lua, -1, static_cast<int>(i));
     std::string func = lua_tostring(lua, -1);
-    lua_pushnil(lua);
-    lua_setglobal(lua, (REDIS_LUA_REGISTER_FUNC_PREFIX + func).c_str());
-    auto _ = storage->Delete(rocksdb::WriteOptions(), cf, engine::kLuaFuncLibPrefix + func);
+    auto _ = storage->Delete(ctx, rocksdb::WriteOptions(), cf, engine::kLuaFuncLibPrefix + func);
     lua_pop(lua, 1);
   }
 
-  lua_pop(lua, 1);
-  lua_pushnil(lua);
-  lua_setfield(lua, -2, name.c_str());
-  lua_pop(lua, 1);
+  lua_pop(lua, 2);
 
-  auto s = storage->Delete(rocksdb::WriteOptions(), cf, engine::kLuaLibCodePrefix + name);
+  auto s = storage->Delete(ctx, rocksdb::WriteOptions(), cf, engine::kLuaLibCodePrefix + name);
   if (!s.ok()) return {Status::NotOK, s.ToString()};
+
+  // reset all lua context from all workers
+  // to ensure the library is removed from all lua states
+  // TODO: optimize it to only delete this library
+  // instead of resetting all libraries
+  conn->GetServer()->ScriptReset();
 
   return Status::OK();
 }
 
-Status EvalGenericCommand(redis::Connection *conn, const std::string &body_or_sha, const std::vector<std::string> &keys,
-                          const std::vector<std::string> &argv, bool evalsha, std::string *output, bool read_only) {
-  Server *srv = conn->GetServer();
+Status FunctionFlush(redis::Connection *conn, engine::Context *ctx) {
+  auto storage = conn->GetServer()->storage;
+  auto cf = storage->GetCFHandle(ColumnFamilyID::Propagate);
 
+  auto s = storage->DeleteRange(*ctx, rocksdb::WriteOptions(), cf, engine::kLuaLibCodePrefix,
+                                util::StringNext(engine::kLuaLibCodePrefix));
+  if (!s.ok()) return {Status::NotOK, s.ToString()};
+
+  s = storage->DeleteRange(*ctx, rocksdb::WriteOptions(), cf, engine::kLuaFuncLibPrefix,
+                           util::StringNext(engine::kLuaFuncLibPrefix));
+  if (!s.ok()) return {Status::NotOK, s.ToString()};
+
+  conn->GetServer()->ScriptReset();
+  return Status::OK();
+}
+
+Status EvalGenericCommand(redis::Connection *conn, engine::Context *ctx, const std::string &body_or_sha,
+                          const std::vector<std::string> &keys, const std::vector<std::string> &argv, bool evalsha,
+                          std::string *output, bool read_only) {
+  Server *srv = conn->GetServer();
   // Use the worker's private Lua VM when entering the read-only mode
-  lua_State *lua = read_only ? conn->Owner()->Lua() : srv->Lua();
+  lua_State *lua = conn->Owner()->Lua();
 
   /* We obtain the script SHA1, then check if this function is already
    * defined into the Lua state */
@@ -611,8 +667,7 @@ Status EvalGenericCommand(redis::Connection *conn, const std::string &body_or_sh
       auto s = srv->ScriptGet(funcname + 2, &body);
       if (!s.IsOK()) {
         lua_pop(lua, 1); /* remove the error handler from the stack. */
-        *output = redis::Error(redis::errNoMatchingScript);
-        return Status::OK();
+        return {Status::RedisNoScript, redis::errNoMatchingScript};
       }
     } else {
       body = body_or_sha;
@@ -628,6 +683,20 @@ Status EvalGenericCommand(redis::Connection *conn, const std::string &body_or_sh
     lua_getglobal(lua, funcname);
   }
 
+  ScriptRunCtx current_script_run_ctx;
+  current_script_run_ctx.conn = conn;
+  current_script_run_ctx.ctx = ctx;
+  current_script_run_ctx.flags = read_only ? ScriptFlagType::kScriptNoWrites : 0;
+  lua_getglobal(lua, fmt::format(REDIS_LUA_FUNC_SHA_FLAGS, funcname + 2).c_str());
+  if (!lua_isnil(lua, -1)) {
+    // It should be ensured that the conversion is successful
+    auto script_flags = lua_tointeger(lua, -1);
+    current_script_run_ctx.flags |= script_flags;
+  }
+  lua_pop(lua, 1);
+
+  SaveOnRegistry(lua, REGISTRY_SCRIPT_RUN_CTX_NAME, &current_script_run_ctx);
+
   // For the Lua script, should be always run with RESP2 protocol,
   // unless users explicitly set the protocol version in the script via `redis.setresp`.
   // So we need to save the current protocol version and set it to RESP2,
@@ -639,9 +708,12 @@ Status EvalGenericCommand(redis::Connection *conn, const std::string &body_or_sh
   SetGlobalArray(lua, "KEYS", keys);
   SetGlobalArray(lua, "ARGV", argv);
 
+  // save keys on registry the to perform key touching check
+  SaveOnRegistry(lua, REGISTRY_KEYS_NAME, &keys);
+
   if (lua_pcall(lua, 0, 1, -2)) {
-    auto msg = fmt::format("ERR running script (call to {}): {}", funcname, lua_tostring(lua, -1));
-    *output = redis::Error(msg);
+    auto msg = fmt::format("running script (call to {}): {}", funcname, lua_tostring(lua, -1));
+    *output = redis::Error({Status::NotOK, msg});
     lua_pop(lua, 2);
   } else {
     *output = ReplyToRedisReply(conn, lua);
@@ -654,6 +726,8 @@ Status EvalGenericCommand(redis::Connection *conn, const std::string &body_or_sh
   lua_setglobal(lua, "KEYS");
   lua_pushnil(lua);
   lua_setglobal(lua, "ARGV");
+  RemoveFromRegistry(lua, REGISTRY_KEYS_NAME);
+  RemoveFromRegistry(lua, REGISTRY_SCRIPT_RUN_CTX_NAME);
 
   /* Call the Lua garbage collector from time to time to avoid a
    * full cycle performed by Lua, which adds too latency.
@@ -661,7 +735,6 @@ Status EvalGenericCommand(redis::Connection *conn, const std::string &body_or_sh
    * The call is performed every LUA_GC_CYCLE_PERIOD executed commands
    * (and for LUA_GC_CYCLE_PERIOD collection steps) because calling it
    * for every command uses too much CPU. */
-  constexpr int64_t LUA_GC_CYCLE_PERIOD = 50;
   static int64_t gc_count = 0;
 
   gc_count++;
@@ -683,21 +756,11 @@ int RedisCallCommand(lua_State *lua) { return RedisGenericCommand(lua, 1); }
 
 int RedisPCallCommand(lua_State *lua) { return RedisGenericCommand(lua, 0); }
 
-Server *GetServer(lua_State *lua) {
-  lua_getglobal(lua, REDIS_LUA_SERVER_PTR);
-  auto srv = reinterpret_cast<Server *>(lua_touserdata(lua, -1));
-  lua_pop(lua, 1);
-
-  return srv;
-}
-
 // TODO: we do not want to repeat same logic as Connection::ExecuteCommands,
 // so the function need to be refactored
 int RedisGenericCommand(lua_State *lua, int raise_error) {
-  lua_getglobal(lua, "redis");
-  lua_getfield(lua, -1, "read_only");
-  int read_only = lua_toboolean(lua, -1);
-  lua_pop(lua, 2);
+  auto *script_run_ctx = GetFromRegistry<ScriptRunCtx>(lua, REGISTRY_SCRIPT_RUN_CTX_NAME);
+  CHECK(script_run_ctx != nullptr);
 
   int argc = lua_gettop(lua);
   if (argc == 0) {
@@ -729,35 +792,76 @@ int RedisGenericCommand(lua_State *lua, int raise_error) {
   auto cmd = *std::move(cmd_s);
 
   auto attributes = cmd->GetAttributes();
-  auto cmd_flags = attributes->GenerateFlags(args);
+  if (!attributes->CheckArity(argc)) {
+    PushError(lua, "Wrong number of args while calling Redis command from Lua script");
+    return raise_error ? RaiseError(lua) : 1;
+  }
 
-  if (read_only && !(cmd_flags & redis::kCmdReadOnly)) {
+  auto *conn = script_run_ctx->conn;
+  auto *srv = conn->GetServer();
+  Config *config = srv->GetConfig();
+
+  auto cmd_flags = attributes->GenerateFlags(args, *config);
+
+  if ((script_run_ctx->flags & ScriptFlagType::kScriptNoWrites) && !(cmd_flags & redis::kCmdReadOnly)) {
     PushError(lua, "Write commands are not allowed from read-only scripts");
     return raise_error ? RaiseError(lua) : 1;
   }
 
-  if (!attributes->CheckArity(argc)) {
-    PushError(lua, "Wrong number of args calling Redis command From Lua script");
-    return raise_error ? RaiseError(lua) : 1;
-  }
-
-  if (cmd_flags & redis::kCmdNoScript) {
+  if ((cmd_flags & redis::kCmdNoScript) || (cmd_flags & redis::kCmdExclusive)) {
     PushError(lua, "This Redis command is not allowed from scripts");
     return raise_error ? RaiseError(lua) : 1;
   }
 
   std::string cmd_name = attributes->name;
+  cmd->SetArgs(args);
+  auto s = cmd->Parse();
+  if (!s) {
+    PushError(lua, s.Msg().data());
+    return raise_error ? RaiseError(lua) : 1;
+  }
 
-  auto srv = GetServer(lua);
-  Config *config = srv->GetConfig();
+  // if it is a write command and strict mode is enabled,
+  // we need to check if the input keys are all in allowed keys
+  if (config->lua_strict_key_accessing && !(cmd_flags & redis::kCmdReadOnly)) {
+    auto allowed_keys = GetFromRegistry<const std::vector<std::string>>(lua, REGISTRY_KEYS_NAME);
 
-  redis::Connection *conn = srv->GetCurrentConnection();
+    attributes->ForEachKeyRange(
+        [&](const std::vector<std::string> &args, const redis::CommandKeyRange &range) {
+          range.ForEachKey(
+              [&](const std::string &key) {
+                if (std::find(allowed_keys->begin(), allowed_keys->end(), key) == allowed_keys->end()) {
+                  PushError(lua, fmt::format("Script attempted to access key '{}' which is not in the allowed keys "
+                                             "(lua-strict-key-accessing)",
+                                             key)
+                                     .c_str());
+                  RaiseError(lua);
+                }
+              },
+              args);
+        },
+        args);
+  }
+
   if (config->cluster_enabled) {
-    auto s = srv->cluster->CanExecByMySelf(attributes, args, conn);
-    if (!s.IsOK()) {
-      PushError(lua, s.Msg().c_str());
+    if (script_run_ctx->flags & ScriptFlagType::kScriptNoCluster) {
+      PushError(lua, "Can not run script on cluster, 'no-cluster' flag is set");
       return raise_error ? RaiseError(lua) : 1;
     }
+    auto s = srv->cluster->CanExecByMySelf(attributes, args, conn, script_run_ctx);
+    if (!s.IsOK()) {
+      if (s.Is<Status::RedisMoved>()) {
+        PushError(lua, "Script attempted to access a non local key in a cluster node script");
+      } else {
+        PushError(lua, redis::StatusToRedisErrorMsg(s).c_str());
+      }
+      return raise_error ? RaiseError(lua) : 1;
+    }
+  }
+
+  if ((cmd_flags & redis::kCmdAdmin) && !conn->IsAdmin()) {
+    PushError(lua, redis::errAdminPermissionRequired);
+    return raise_error ? RaiseError(lua) : 1;
   }
 
   if (config->slave_readonly && srv->IsSlave() && (cmd_flags & redis::kCmdWrite)) {
@@ -773,18 +877,15 @@ int RedisGenericCommand(lua_State *lua, int raise_error) {
     return raise_error ? RaiseError(lua) : 1;
   }
 
-  cmd->SetArgs(args);
-  auto s = cmd->Parse();
+  std::string output;
+  s = conn->ExecuteCommand(*script_run_ctx->ctx, cmd_name, args, cmd.get(), &output);
   if (!s) {
     PushError(lua, s.Msg().data());
     return raise_error ? RaiseError(lua) : 1;
   }
 
-  std::string output;
-  s = conn->ExecuteCommand(cmd_name, args, cmd.get(), &output);
-  if (!s) {
-    PushError(lua, s.Msg().data());
-    return raise_error ? RaiseError(lua) : 1;
+  if (!(cmd_flags & redis::kCmdSkipMonitor)) {
+    srv->FeedMonitorConns(conn, args);
   }
 
   RedisProtocolToLuaType(lua, output.data());
@@ -863,8 +964,10 @@ int RedisReturnSingleFieldTable(lua_State *lua, const char *field) {
 }
 
 int RedisSetResp(lua_State *lua) {
-  auto srv = GetServer(lua);
-  auto conn = srv->GetCurrentConnection();
+  auto *script_run_ctx = GetFromRegistry<ScriptRunCtx>(lua, REGISTRY_SCRIPT_RUN_CTX_NAME);
+  CHECK(script_run_ctx != nullptr);
+  auto *conn = script_run_ctx->conn;
+  auto *srv = conn->GetServer();
 
   if (lua_gettop(lua) != 1) {
     PushError(lua, "redis.setresp() requires one argument.");
@@ -1192,7 +1295,7 @@ std::string ReplyToRedisReply(redis::Connection *conn, lua_State *lua) {
       lua_rawget(lua, -2);
       t = lua_type(lua, -1);
       if (t == LUA_TSTRING) {
-        output = redis::Error(lua_tostring(lua, -1));
+        output = redis::Error({Status::RedisErrorNoPrefix, lua_tostring(lua, -1)});
         lua_pop(lua, 1);
         return output;
       }
@@ -1456,7 +1559,23 @@ Status CreateFunction(Server *srv, const std::string &body, std::string *sha, lu
     std::copy(sha->begin(), sha->end(), funcname + 2);
   }
 
-  if (luaL_loadbuffer(lua, body.c_str(), body.size(), "@user_script")) {
+  std::string_view lua_code(body);
+  // Cache the flags of the current script
+  ScriptFlags script_flags = 0;
+  if (auto pos = body.find('\n'); pos != std::string::npos) {
+    std::string_view first_line(body.data(), pos);
+    if (first_line.substr(0, 2) == "#!") {
+      lua_code = lua_code.substr(pos + 1);
+    }
+    script_flags = GET_OR_RET(ExtractFlagsFromShebang(first_line));
+  } else {
+    // scripts without #! can run commands that access keys belonging to different cluster hash slots
+    script_flags = kScriptAllowCrossSlotKeys;
+  }
+  lua_pushinteger(lua, static_cast<lua_Integer>(script_flags));
+  lua_setglobal(lua, fmt::format(REDIS_LUA_FUNC_SHA_FLAGS, *sha).c_str());
+
+  if (luaL_loadbuffer(lua, lua_code.data(), lua_code.size(), "@user_script")) {
     std::string err_msg = lua_tostring(lua, -1);
     lua_pop(lua, 1);
     return {Status::NotOK, "Error while compiling new script: " + err_msg};
@@ -1465,6 +1584,125 @@ Status CreateFunction(Server *srv, const std::string &body, std::string *sha, lu
 
   // would store lua function into propagate column family and propagate those scripts to slaves
   return need_to_store ? srv->ScriptSet(*sha, body) : Status::OK();
+}
+
+[[nodiscard]] StatusOr<std::string> ExtractLibNameFromShebang(std::string_view shebang) {
+  static constexpr std::string_view lua_shebang_prefix = "#!lua";
+  static constexpr std::string_view shebang_libname_prefix = "name=";
+
+  if (shebang.substr(0, 2) != "#!") {
+    return {Status::NotOK, "Missing library meta"};
+  }
+
+  auto shebang_splits = util::Split(shebang, " ");
+  if (shebang_splits.empty() || shebang_splits[0] != lua_shebang_prefix) {
+    return {Status::NotOK, "Unexpected engine in script shebang: " + shebang_splits[0]};
+  }
+
+  std::string libname;
+  bool found_libname = false;
+  for (size_t i = 1; i < shebang_splits.size(); i++) {
+    std::string_view shebang_split_sv = shebang_splits[i];
+    if (shebang_split_sv.substr(0, shebang_libname_prefix.size()) != shebang_libname_prefix) {
+      return {Status::NotOK, "Unknown lua shebang option: " + shebang_splits[i]};
+    }
+    if (found_libname) {
+      return {Status::NotOK, "Redundant library name in script shebang"};
+    }
+
+    libname = shebang_split_sv.substr(shebang_libname_prefix.size());
+    if (libname.empty() ||
+        std::any_of(libname.begin(), libname.end(), [](char v) { return !std::isalnum(v) && v != '_'; })) {
+      return {Status::NotOK,
+              "Library names can only contain letters, numbers, or underscores(_) and must be at least one "
+              "character long"};
+    }
+    found_libname = true;
+  }
+
+  if (found_libname) return libname;
+  return {Status::NotOK, "Library name was not given"};
+}
+
+[[nodiscard]] StatusOr<ScriptFlags> GetFlagsFromStrings(const std::vector<std::string> &flags_content) {
+  ScriptFlags flags = 0;
+  for (const auto &flag : flags_content) {
+    if (flag == "no-writes") {
+      flags |= kScriptNoWrites;
+    } else if (flag == "allow-oom") {
+      return {Status::NotSupported, "allow-oom is not supported yet"};
+    } else if (flag == "allow-stale") {
+      return {Status::NotSupported, "allow-stale is not supported yet"};
+    } else if (flag == "no-cluster") {
+      flags |= kScriptNoCluster;
+    } else if (flag == "allow-cross-slot-keys") {
+      flags |= kScriptAllowCrossSlotKeys;
+    } else {
+      return {Status::NotOK, "Unknown flag given: " + flag};
+    }
+  }
+  return flags;
+}
+
+[[nodiscard]] StatusOr<ScriptFlags> ExtractFlagsFromShebang(std::string_view shebang) {
+  static constexpr std::string_view lua_shebang_prefix = "#!lua";
+  static constexpr std::string_view shebang_flags_prefix = "flags=";
+
+  ScriptFlags result_flags = 0;
+  if (shebang.substr(0, 2) == "#!") {
+    auto shebang_splits = util::Split(shebang, " ");
+    if (shebang_splits.empty() || shebang_splits[0] != lua_shebang_prefix) {
+      return {Status::NotOK, "Unexpected engine in script shebang: " + shebang_splits[0]};
+    }
+    bool found_flags = false;
+    for (size_t i = 1; i < shebang_splits.size(); i++) {
+      std::string_view shebang_split_sv = shebang_splits[i];
+      if (shebang_split_sv.substr(0, shebang_flags_prefix.size()) != shebang_flags_prefix) {
+        return {Status::NotOK, "Unknown lua shebang option: " + shebang_splits[i]};
+      }
+      if (found_flags) {
+        return {Status::NotOK, "Redundant flags in script shebang"};
+      }
+      auto flags_content = util::Split(shebang_split_sv.substr(shebang_flags_prefix.size()), ",");
+      result_flags |= GET_OR_RET(GetFlagsFromStrings(flags_content));
+      found_flags = true;
+    }
+  } else {
+    // scripts without #! can run commands that access keys belonging to different cluster hash slots,
+    // but ones with #! inherit the default flags, so they cannot.
+    result_flags = kScriptAllowCrossSlotKeys;
+  }
+
+  return result_flags;
+}
+
+[[nodiscard]] StatusOr<ScriptFlags> ExtractFlagsFromRegisterFunction(lua_State *lua) {
+  if (!lua_istable(lua, -1)) {
+    return {Status::NotOK, "Expects a valid flags argument to register_function, e.g. flags={ 'no-writes' }"};
+  }
+  auto flag_count = static_cast<int>(lua_objlen(lua, -1));
+  std::vector<std::string> flags_content;
+  flags_content.reserve(flag_count);
+  for (int i = 1; i <= flag_count; ++i) {
+    lua_pushnumber(lua, i);
+    lua_gettable(lua, -2);
+    if (!lua_isstring(lua, -1)) {
+      return {Status::NotOK, "Expects a valid flags argument to register_function, e.g. flags={ 'no-writes' }"};
+    }
+    flags_content.emplace_back(lua_tostring(lua, -1));
+    // pop up the current flag
+    lua_pop(lua, 1);
+  }
+  // pop up the corresponding table of the flags parameter
+  lua_pop(lua, 1);
+
+  return GetFlagsFromStrings(flags_content);
+}
+
+void RemoveFromRegistry(lua_State *lua, const char *name) {
+  lua_pushstring(lua, name);
+  lua_pushnil(lua);
+  lua_settable(lua, LUA_REGISTRYINDEX);
 }
 
 }  // namespace lua

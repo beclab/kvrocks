@@ -48,7 +48,8 @@ if (NOT lua_POPULATED)
   FetchContent_Populate(luajit)
 
   set(LUA_CFLAGS "-DLUA_ANSI -DENABLE_CJSON_GLOBAL -DREDIS_STATIC= -DLUA_USE_MKSTEMP")
-  if (CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
+  if((CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang") OR
+   (CMAKE_SYSTEM_NAME STREQUAL "Darwin" AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang"))
     set(LUA_CFLAGS "${LUA_CFLAGS} -isysroot ${CMAKE_OSX_SYSROOT}")
   endif ()
 
@@ -56,7 +57,7 @@ if (NOT lua_POPULATED)
     set(MACOSX_TARGET "MACOSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}")
   endif ()
 
-  add_custom_target(make_luajit COMMAND ${MAKE_COMMAND} libluajit.a
+  add_custom_target(make_luajit COMMAND ${MAKE_COMMAND} libluajit.a ${NINJA_MAKE_JOBS_FLAG}
     "CFLAGS=${LUA_CFLAGS}" ${MACOSX_TARGET}
     WORKING_DIRECTORY ${luajit_SOURCE_DIR}/src
     BYPRODUCTS ${luajit_SOURCE_DIR}/src/libluajit.a

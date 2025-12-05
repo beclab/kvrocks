@@ -47,7 +47,11 @@ class CommandCluster : public Commander {
 
     if (subcommand_ == "import") {
       if (args.size() != 4) return {Status::RedisParseErr, errWrongNumOfArguments};
-      slot_ = GET_OR_RET(ParseInt<int64_t>(args[2], 10));
+
+      Status s = CommandTable::ParseSlotRanges(args_[2], slot_ranges_);
+      if (!s.IsOK()) {
+        return s;
+      }
 
       auto state = ParseInt<unsigned>(args[3], {kImportStart, kImportNone}, 10);
       if (!state) return {Status::NotOK, "Invalid import state"};
@@ -61,13 +65,9 @@ class CommandCluster : public Commander {
     return {Status::RedisParseErr, "CLUSTER command, CLUSTER INFO|NODES|SLOTS|KEYSLOT|RESET|REPLICAS"};
   }
 
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute([[maybe_unused]] engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     if (!srv->GetConfig()->cluster_enabled) {
       return {Status::RedisExecErr, "Cluster mode is not enabled"};
-    }
-
-    if (!conn->IsAdmin()) {
-      return {Status::RedisExecErr, errAdminPermissionRequired};
     }
 
     if (subcommand_ == "keyslot") {
@@ -90,7 +90,7 @@ class CommandCluster : public Commander {
           }
         }
       } else {
-        return {Status::RedisExecErr, s.Msg()};
+        return s;
       }
     } else if (subcommand_ == "nodes") {
       std::string nodes_desc;
@@ -98,7 +98,7 @@ class CommandCluster : public Commander {
       if (s.IsOK()) {
         *output = conn->VerbatimString("txt", nodes_desc);
       } else {
-        return {Status::RedisExecErr, s.Msg()};
+        return s;
       }
     } else if (subcommand_ == "info") {
       std::string cluster_info;
@@ -106,21 +106,22 @@ class CommandCluster : public Commander {
       if (s.IsOK()) {
         *output = conn->VerbatimString("txt", cluster_info);
       } else {
-        return {Status::RedisExecErr, s.Msg()};
+        return s;
       }
     } else if (subcommand_ == "import") {
-      Status s = srv->cluster->ImportSlot(conn, static_cast<int>(slot_), state_);
+      // TODO: support multiple slot ranges
+      Status s = srv->cluster->ImportSlotRange(conn, slot_ranges_[0], state_);
       if (s.IsOK()) {
-        *output = redis::SimpleString("OK");
+        *output = redis::RESP_OK;
       } else {
-        return {Status::RedisExecErr, s.Msg()};
+        return s;
       }
     } else if (subcommand_ == "reset") {
       Status s = srv->cluster->Reset();
       if (s.IsOK()) {
-        *output = redis::SimpleString("OK");
+        *output = redis::RESP_OK;
       } else {
-        return {Status::RedisExecErr, s.Msg()};
+        return s;
       }
     } else if (subcommand_ == "replicas") {
       auto node_id = args_[2];
@@ -128,7 +129,7 @@ class CommandCluster : public Commander {
       if (s.IsOK()) {
         *output = conn->VerbatimString("txt", s.GetValue());
       } else {
-        return {Status::RedisExecErr, s.Msg()};
+        return s;
       }
     } else {
       return {Status::RedisExecErr, "Invalid cluster command options"};
@@ -138,7 +139,7 @@ class CommandCluster : public Commander {
 
  private:
   std::string subcommand_;
-  int64_t slot_ = -1;
+  std::vector<SlotRange> slot_ranges_;
   ImportStatus state_ = kImportNone;
 };
 
@@ -154,7 +155,10 @@ class CommandClusterX : public Commander {
     if (subcommand_ == "migrate") {
       if (args.size() < 4 || args.size() > 6) return {Status::RedisParseErr, errWrongNumOfArguments};
 
-      slot_ = GET_OR_RET(ParseInt<int64_t>(args[2], 10));
+      Status s = CommandTable::ParseSlotRanges(args_[2], slot_ranges_);
+      if (!s.IsOK()) {
+        return s;
+      }
 
       dst_node_id_ = args[3];
 
@@ -236,13 +240,9 @@ class CommandClusterX : public Commander {
     return {Status::RedisParseErr, "CLUSTERX command, CLUSTERX VERSION|MYID|SETNODEID|SETNODES|SETSLOT|MIGRATE"};
   }
 
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute([[maybe_unused]] engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     if (!srv->GetConfig()->cluster_enabled) {
       return {Status::RedisExecErr, "Cluster mode is not enabled"};
-    }
-
-    if (!conn->IsAdmin()) {
-      return {Status::RedisExecErr, errAdminPermissionRequired};
     }
 
     bool need_persist_nodes_info = false;
@@ -250,25 +250,25 @@ class CommandClusterX : public Commander {
       Status s = srv->cluster->SetClusterNodes(nodes_str_, set_version_, force_);
       if (s.IsOK()) {
         need_persist_nodes_info = true;
-        *output = redis::SimpleString("OK");
+        *output = redis::RESP_OK;
       } else {
-        return {Status::RedisExecErr, s.Msg()};
+        return s;
       }
     } else if (subcommand_ == "setnodeid") {
       Status s = srv->cluster->SetNodeId(args_[2]);
       if (s.IsOK()) {
         need_persist_nodes_info = true;
-        *output = redis::SimpleString("OK");
+        *output = redis::RESP_OK;
       } else {
-        return {Status::RedisExecErr, s.Msg()};
+        return s;
       }
     } else if (subcommand_ == "setslot") {
       Status s = srv->cluster->SetSlotRanges(slot_ranges_, args_[4], set_version_);
       if (s.IsOK()) {
         need_persist_nodes_info = true;
-        *output = redis::SimpleString("OK");
+        *output = redis::RESP_OK;
       } else {
-        return {Status::RedisExecErr, s.Msg()};
+        return s;
       }
     } else if (subcommand_ == "version") {
       int64_t v = srv->cluster->GetVersion();
@@ -279,15 +279,15 @@ class CommandClusterX : public Commander {
       if (sync_migrate_) {
         sync_migrate_ctx_ = std::make_unique<SyncMigrateContext>(srv, conn, sync_migrate_timeout_);
       }
-
-      Status s = srv->cluster->MigrateSlot(static_cast<int>(slot_), dst_node_id_, sync_migrate_ctx_.get());
+      // TODO: support multiple slot ranges
+      Status s = srv->cluster->MigrateSlotRange(slot_ranges_[0], dst_node_id_, sync_migrate_ctx_.get());
       if (s.IsOK()) {
         if (sync_migrate_) {
           return {Status::BlockingCmd};
         }
-        *output = redis::SimpleString("OK");
+        *output = redis::RESP_OK;
       } else {
-        return {Status::RedisExecErr, s.Msg()};
+        return s;
       }
     } else {
       return {Status::RedisExecErr, "Invalid cluster command options"};
@@ -303,7 +303,6 @@ class CommandClusterX : public Commander {
   std::string nodes_str_;
   std::string dst_node_id_;
   int64_t set_version_ = 0;
-  int64_t slot_ = -1;
   std::vector<SlotRange> slot_ranges_;
   bool force_ = false;
 
@@ -322,8 +321,9 @@ static uint64_t GenerateClusterFlag(uint64_t flags, const std::vector<std::strin
 
 class CommandReadOnly : public Commander {
  public:
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
-    *output = redis::SimpleString("OK");
+  Status Execute([[maybe_unused]] engine::Context &ctx, [[maybe_unused]] Server *srv, Connection *conn,
+                 std::string *output) override {
+    *output = redis::RESP_OK;
     conn->EnableFlag(redis::Connection::kReadOnly);
     return Status::OK();
   }
@@ -331,8 +331,9 @@ class CommandReadOnly : public Commander {
 
 class CommandReadWrite : public Commander {
  public:
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
-    *output = redis::SimpleString("OK");
+  Status Execute([[maybe_unused]] engine::Context &ctx, [[maybe_unused]] Server *srv, Connection *conn,
+                 std::string *output) override {
+    *output = redis::RESP_OK;
     conn->DisableFlag(redis::Connection::kReadOnly);
     return Status::OK();
   }
@@ -340,17 +341,19 @@ class CommandReadWrite : public Commander {
 
 class CommandAsking : public Commander {
  public:
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute([[maybe_unused]] engine::Context &ctx, [[maybe_unused]] Server *srv, Connection *conn,
+                 std::string *output) override {
     conn->EnableFlag(redis::Connection::kAsking);
-    *output = redis::SimpleString("OK");
+    *output = redis::RESP_OK;
     return Status::OK();
   }
 };
 
-REDIS_REGISTER_COMMANDS(MakeCmdAttr<CommandCluster>("cluster", -2, "cluster no-script", 0, 0, 0, GenerateClusterFlag),
-                        MakeCmdAttr<CommandClusterX>("clusterx", -2, "cluster no-script", 0, 0, 0, GenerateClusterFlag),
-                        MakeCmdAttr<CommandReadOnly>("readonly", 1, "cluster no-multi", 0, 0, 0),
-                        MakeCmdAttr<CommandReadWrite>("readwrite", 1, "cluster no-multi", 0, 0, 0),
-                        MakeCmdAttr<CommandAsking>("asking", 1, "cluster", 0, 0, 0), )
+REDIS_REGISTER_COMMANDS(Cluster,
+                        MakeCmdAttr<CommandCluster>("cluster", -2, "no-script admin", NO_KEY, GenerateClusterFlag),
+                        MakeCmdAttr<CommandClusterX>("clusterx", -2, "no-script admin", NO_KEY, GenerateClusterFlag),
+                        MakeCmdAttr<CommandReadOnly>("readonly", 1, "no-multi", NO_KEY),
+                        MakeCmdAttr<CommandReadWrite>("readwrite", 1, "no-multi", NO_KEY),
+                        MakeCmdAttr<CommandAsking>("asking", 1, "", NO_KEY), )
 
 }  // namespace redis

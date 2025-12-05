@@ -22,13 +22,31 @@ package incr
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/apache/kvrocks/tests/gocase/util"
 	"github.com/stretchr/testify/require"
 )
 
 func TestIncr(t *testing.T) {
-	srv := util.StartServer(t, map[string]string{})
+	configOptions := []util.ConfigOptions{
+		{
+			Name:       "txn-context-enabled",
+			Options:    []string{"yes", "no"},
+			ConfigType: util.YesNo,
+		},
+	}
+
+	configsMatrix, err := util.GenerateConfigsMatrix(configOptions)
+	require.NoError(t, err)
+
+	for _, configs := range configsMatrix {
+		testIncr(t, configs)
+	}
+}
+
+func testIncr(t *testing.T, configs util.KvrocksServerConfigs) {
+	srv := util.StartServer(t, configs)
 	defer srv.Close()
 	ctx := context.Background()
 	rdb := srv.NewClient()
@@ -56,6 +74,14 @@ func TestIncr(t *testing.T) {
 	t.Run("INCRBY over 32bit value with over 32bit increment", func(t *testing.T) {
 		require.NoError(t, rdb.Set(ctx, "novar", 17179869184, 0).Err())
 		require.EqualValues(t, 34359738368, rdb.IncrBy(ctx, "novar", 17179869184).Val())
+	})
+
+	t.Run("INCR over an expired key", func(t *testing.T) {
+		require.NoError(t, rdb.SetEx(ctx, "expired-foo", "1024", 2*time.Second).Err())
+		require.NoError(t, rdb.SetEx(ctx, "expired-str", "value", 2*time.Second).Err())
+		time.Sleep(3 * time.Second)
+		require.EqualValues(t, 1, rdb.IncrBy(ctx, "expired-foo", 1).Val())
+		require.EqualValues(t, 1, rdb.IncrBy(ctx, "expired-str", 1).Val())
 	})
 
 	t.Run("INCR fails against key with spaces (left)", func(t *testing.T) {
@@ -114,6 +140,12 @@ func TestIncr(t *testing.T) {
 	t.Run("INCRBYFLOAT over 32bit value with over 32bit increment", func(t *testing.T) {
 		require.NoError(t, rdb.Set(ctx, "novar", 17179869184, 0).Err())
 		require.EqualValues(t, 34359738368, rdb.IncrByFloat(ctx, "novar", 17179869184).Val())
+	})
+
+	t.Run("INCRBYFLOAT over an expired key", func(t *testing.T) {
+		require.NoError(t, rdb.SetEx(ctx, "expired-foo", "10.24", 2*time.Second).Err())
+		time.Sleep(3 * time.Second)
+		require.EqualValues(t, 1, rdb.IncrBy(ctx, "expired-foo", 1.0).Val())
 	})
 
 	t.Run("INCRBYFLOAT fails against key with spaces (left)", func(t *testing.T) {

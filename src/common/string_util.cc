@@ -42,6 +42,11 @@ std::string ToLower(std::string in) {
   return in;
 }
 
+std::string ToUpper(std::string in) {
+  std::transform(in.begin(), in.end(), in.begin(), [](char c) -> char { return static_cast<char>(std::toupper(c)); });
+  return in;
+}
+
 bool EqualICase(std::string_view lhs, std::string_view rhs) {
   return lhs.size() == rhs.size() && std::equal(lhs.begin(), lhs.end(), rhs.begin(),
                                                 [](char l, char r) { return std::tolower(l) == std::tolower(r); });
@@ -96,123 +101,289 @@ std::vector<std::string> Split2KV(const std::string &in, const std::string &deli
   return out;
 }
 
-bool HasPrefix(const std::string &str, const std::string &prefix) {
-  if (str.empty() || prefix.empty()) return false;
-  return !strncasecmp(str.data(), prefix.data(), prefix.size());
+bool StartsWith(std::string_view str, std::string_view prefix) {
+  return str.size() >= prefix.size() && str.compare(0, prefix.size(), prefix) == 0;
+}
+bool StartsWithICase(std::string_view str, std::string_view prefix) {
+  return str.size() >= prefix.size() && EqualICase(str.substr(0, prefix.size()), prefix);
 }
 
-int StringMatch(const std::string &pattern, const std::string &in, int nocase) {
-  return StringMatchLen(pattern.c_str(), pattern.length(), in.c_str(), in.length(), nocase);
+bool EndsWith(std::string_view str, std::string_view suffix) {
+  return str.size() >= suffix.size() && str.compare(str.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+bool EndsWithICase(std::string_view str, std::string_view suffix) {
+  return str.size() >= suffix.size() && EqualICase(str.substr(str.size() - suffix.size()), suffix);
 }
 
-// Glob-style pattern matching.
-int StringMatchLen(const char *pattern, size_t pattern_len, const char *string, size_t string_len, int nocase) {
-  while (pattern_len && string_len) {
+Status ValidateGlob(std::string_view glob) {
+  for (size_t idx = 0; idx < glob.size(); ++idx) {
+    switch (glob[idx]) {
+      case '*':
+      case '?':
+        break;
+      case ']':
+        return {Status::NotOK, "Unmatched unescaped ]"};
+      case '\\':
+        if (idx == glob.size() - 1) {
+          return {Status::NotOK, "Trailing unescaped backslash"};
+        }
+        // Skip the next character: this is a literal so nothing can go wrong
+        idx++;
+        break;
+      case '[':
+        idx++;  // Skip the opening bracket
+        while (idx < glob.size() && glob[idx] != ']') {
+          if (glob[idx] == '\\') {
+            idx += 2;
+            continue;
+          } else if (idx + 1 < glob.size() && glob[idx + 1] == '-') {
+            if (idx + 2 >= glob.size()) {
+              return {Status::NotOK, "Unterminated character range"};
+            }
+            // Skip the - and the end of the range
+            idx += 2;
+          }
+          idx++;
+        }
+        if (idx == glob.size()) {
+          return {Status::NotOK, "Unterminated [ group"};
+        }
+        break;
+      default:
+        // This is a literal: nothing can go wrong
+        break;
+    }
+  }
+  return Status::OK();
+}
+
+constexpr bool StringMatchImpl(std::string_view pattern, std::string_view string, bool ignore_case,
+                               bool *skip_longer_matches, size_t recursion_depth = 0) {
+  // If we want to ignore case, this is equivalent to converting both the pattern and the string to lowercase
+  const auto canonicalize = [ignore_case](unsigned char c) -> unsigned char {
+    return ignore_case ? static_cast<unsigned char>(std::tolower(c)) : c;
+  };
+
+  if (recursion_depth > 1000) return false;
+
+  while (!pattern.empty() && !string.empty()) {
     switch (pattern[0]) {
       case '*':
-        while (pattern[1] == '*') {
-          pattern++;
-          pattern_len--;
+        // Optimization: collapse multiple * into one
+        while (pattern.size() >= 2 && pattern[1] == '*') {
+          pattern.remove_prefix(1);
         }
-
-        if (pattern_len == 1) return 1; /* match */
-
-        while (string_len) {
-          if (StringMatchLen(pattern + 1, pattern_len - 1, string, string_len, nocase)) return 1; /* match */
-          string++;
-          string_len--;
+        // Optimization: If the '*' is the last character in the pattern, it can match anything
+        if (pattern.length() == 1) return true;
+        while (!string.empty()) {
+          if (StringMatchImpl(pattern.substr(1), string, ignore_case, skip_longer_matches, recursion_depth + 1))
+            return true;
+          if (*skip_longer_matches) return false;
+          string.remove_prefix(1);
         }
-        return 0; /* no match */
+        // There was no match for the rest of the pattern starting
+        // from anywhere in the rest of the string. If there were
+        // any '*' earlier in the pattern, we can terminate the
+        // search early without trying to match them to longer
+        // substrings. This is because a longer match for the
+        // earlier part of the pattern would require the rest of the
+        // pattern to match starting later in the string, and we
+        // have just determined that there is no match for the rest
+        // of the pattern starting from anywhere in the current
+        // string.
+        *skip_longer_matches = true;
+        return false;
       case '?':
-        string++;
-        string_len--;
+        if (string.empty()) return false;
+        string.remove_prefix(1);
         break;
       case '[': {
-        pattern++;
-        pattern_len--;
-        int not_symbol = pattern[0] == '^';
-        if (not_symbol) {
-          pattern++;
-          pattern_len--;
-        }
+        pattern.remove_prefix(1);
+        const bool invert = pattern[0] == '^';
+        if (invert) pattern.remove_prefix(1);
 
-        int match = 0;
+        bool match = false;
         while (true) {
-          if (pattern[0] == '\\' && pattern_len >= 2) {
-            pattern++;
-            pattern_len--;
-            if (pattern[0] == string[0]) match = 1;
+          if (pattern.empty()) {
+            // unterminated [ group: reject invalid pattern
+            return false;
           } else if (pattern[0] == ']') {
             break;
-          } else if (pattern_len == 0) {
-            pattern--;
-            pattern_len++;
-            break;
-          } else if (pattern[1] == '-' && pattern_len >= 3) {
-            int start = pattern[0];
-            int end = pattern[2];
-            int c = string[0];
-            if (start > end) {
-              int t = start;
-              start = end;
-              end = t;
-            }
-            if (nocase) {
-              start = tolower(start);
-              end = tolower(end);
-              c = tolower(c);
-            }
-            pattern += 2;
-            pattern_len -= 2;
-            if (c >= start && c <= end) match = 1;
-          } else {
-            if (!nocase) {
-              if (pattern[0] == string[0]) match = 1;
-            } else {
-              if (tolower(static_cast<int>(pattern[0])) == tolower(static_cast<int>(string[0]))) match = 1;
-            }
+          } else if (pattern.length() >= 2 && pattern[0] == '\\') {
+            pattern.remove_prefix(1);
+            if (pattern[0] == string[0]) match = true;
+          } else if (pattern.length() >= 3 && pattern[1] == '-') {
+            unsigned char start = canonicalize(pattern[0]);
+            unsigned char end = canonicalize(pattern[2]);
+            if (start > end) std::swap(start, end);
+            const int c = canonicalize(string[0]);
+            pattern.remove_prefix(2);
+
+            if (c >= start && c <= end) match = true;
+          } else if (canonicalize(pattern[0]) == canonicalize(string[0])) {
+            match = true;
           }
-          pattern++;
-          pattern_len--;
+          pattern.remove_prefix(1);
         }
-
-        if (not_symbol) match = !match;
-
-        if (!match) return 0; /* no match */
-
-        string++;
-        string_len--;
+        if (invert) match = !match;
+        if (!match) return false;
+        string.remove_prefix(1);
         break;
       }
       case '\\':
-        if (pattern_len >= 2) {
-          pattern++;
-          pattern_len--;
+        if (pattern.length() >= 2) {
+          pattern.remove_prefix(1);
         }
-        /* fall through */
+        [[fallthrough]];
       default:
-        if (!nocase) {
-          if (pattern[0] != string[0]) return 0; /* no match */
+        // Just a normal character
+        if (!ignore_case) {
+          if (pattern[0] != string[0]) return false;
         } else {
-          if (tolower(static_cast<int>(pattern[0])) != tolower(static_cast<int>(string[0]))) return 0; /* no match */
+          if (std::tolower((int)pattern[0]) != std::tolower((int)string[0])) return false;
         }
-        string++;
-        string_len--;
+        string.remove_prefix(1);
         break;
     }
-    pattern++;
-    pattern_len--;
-    if (string_len == 0) {
-      while (*pattern == '*') {
-        pattern++;
-        pattern_len--;
-      }
-      break;
-    }
+    pattern.remove_prefix(1);
   }
 
-  if (pattern_len == 0 && string_len == 0) return 1;
+  // Now that either the pattern is empty or the string is empty, this is a match iff
+  // the pattern consists only of '*', and the string is empty.
+  return string.empty() && std::all_of(pattern.begin(), pattern.end(), [](char c) { return c == '*'; });
+}
+
+// Given a glob [pattern] and a string [string], return true iff the string matches the glob.
+// If [ignore_case] is true, the match is case-insensitive.
+bool StringMatch(std::string_view glob, std::string_view str, bool ignore_case) {
+  bool skip_longer_matches = false;
+  return StringMatchImpl(glob, str, ignore_case, &skip_longer_matches);
+}
+
+// Split a glob pattern into a literal prefix and a suffix containing wildcards.
+// For example, if the user calls [KEYS bla*bla], this function will return {"bla", "*bla"}.
+// This allows the caller of this function to optimize this call by performing a
+// prefix-scan on "bla" and then filtering the results using the GlobMatches function.
+std::pair<std::string, std::string> SplitGlob(std::string_view glob) {
+  // Stores the prefix of the glob pattern, with backslashes removed
+  std::string prefix;
+  // Find the first un-escaped '*', '?' or '[' character in [glob]
+  for (size_t idx = 0; idx < glob.size(); ++idx) {
+    if (glob[idx] == '*' || glob[idx] == '?' || glob[idx] == '[') {
+      // Return a pair of views: the part of the glob before the wildcard, and the part after
+      return {prefix, std::string(glob.substr(idx))};
+    } else if (glob[idx] == '\\') {
+      // Skip checking whether the next character is a special character
+      ++idx;
+      // Append the escaped special character to the prefix
+      if (idx < glob.size()) prefix.push_back(glob[idx]);
+    } else {
+      prefix.push_back(glob[idx]);
+    }
+  }
+  // No wildcard found, return the entire string (without the backslashes) as the prefix
+  return {prefix, ""};
+}
+
+static int HexDigitToInt(const char c) {
+  if (c >= '0' && c <= '9') {
+    return c - '0';
+  } else if (c >= 'a' && c <= 'f') {
+    return c - 'a' + 10;
+  } else if (c >= 'A' && c <= 'F') {
+    return c - 'A' + 10;
+  }
   return 0;
+}
+
+StatusOr<std::vector<std::string>> SplitArguments(std::string_view in) {
+  std::vector<std::string> arguments;
+  std::string current_string;
+
+  enum State { NORMAL, DOUBLE_QUOTED, SINGLE_QUOTED, ESCAPE } state = NORMAL;
+
+  bool done = false;
+  for (size_t i = 0; i < in.size() && !done; i++) {
+    const auto c = in[i];
+    switch (state) {
+      case NORMAL:
+        if (std::isspace(c)) {
+          if (!current_string.empty()) {
+            arguments.emplace_back(std::move(current_string));
+            current_string.clear();
+          }
+        } else if (c == '\r' || c == '\n' || c == '\t') {
+          done = true;
+        } else if (c == '"') {
+          state = DOUBLE_QUOTED;
+        } else if (c == '\'') {
+          state = SINGLE_QUOTED;
+        } else {
+          current_string.push_back(c);
+        }
+        break;
+      case SINGLE_QUOTED:
+        if (c == '\\' && (i + 1) < in.size() && in[i + 1] == '\'') {
+          current_string.push_back('\'');
+          i++;
+        } else if (c == '\'') {
+          //
+          if (i + 1 < in.size() && !std::isspace(in[i + 1])) {
+            return {Status::NotOK, "the closed single quote must be followed by a space"};
+          }
+          state = NORMAL;
+        } else {
+          current_string.push_back(c);
+        }
+        break;
+      case DOUBLE_QUOTED:
+        if (c == '\\') {
+          state = ESCAPE;
+        } else if (c == '"') {
+          if (i + 1 < in.size() && !std::isspace(in[i + 1])) {
+            return {Status::NotOK, "the closed double quote must be followed by a space"};
+          }
+          state = NORMAL;
+        } else {
+          current_string.push_back(c);
+        }
+        break;
+      case ESCAPE:
+        // It's the hex digit after the \x
+        if (c == 'x' && (i + 2) < in.size() && std::isxdigit(in[i + 1]) && std::isxdigit(in[i + 2])) {
+          // Convert the hex digit to a char
+          auto hex_byte = static_cast<char>(HexDigitToInt(in[i + 1]) * 16 | HexDigitToInt(in[i + 2]));
+          current_string.push_back(hex_byte);
+          i += 2;
+        } else if (c == '"' || c == '\'' || c == '\\') {
+          current_string.push_back(c);
+        } else if (c == 'n') {
+          current_string.push_back('\n');
+        } else if (c == 'r') {
+          current_string.push_back('\r');
+        } else if (c == 't') {
+          current_string.push_back('\t');
+        } else if (c == 'b') {
+          current_string.push_back('\b');
+        } else if (c == 'a') {
+          current_string.push_back('\a');
+        } else {
+          current_string.push_back(c);
+        }
+        state = DOUBLE_QUOTED;
+        break;
+    }
+  }
+  if (state == DOUBLE_QUOTED || state == SINGLE_QUOTED) {
+    return {Status::NotOK, "unclosed quote string"};
+  }
+  if (state == ESCAPE) {
+    return {Status::NotOK, "unexpected trailing escape character"};
+  }
+  if (!current_string.empty()) {
+    arguments.emplace_back(std::move(current_string));
+  }
+  return arguments;
 }
 
 std::vector<std::string> RegexMatch(const std::string &str, const std::string &regex) {
@@ -367,14 +538,22 @@ std::string EscapeString(std::string_view s) {
         if (isprint(ch)) {
           str += ch;
         } else {
-          char buffer[16];
-          snprintf(buffer, sizeof(buffer), "\\x%02x", ch);
-          str += buffer;
+          str += fmt::format("\\x{:02x}", (unsigned char)ch);
         }
     }
   }
 
   return str;
+}
+
+std::string StringNext(std::string s) {
+  for (auto iter = s.rbegin(); iter != s.rend(); ++iter) {
+    if (*iter != char(0xff)) {
+      (*iter)++;
+      break;
+    }
+  }
+  return s;
 }
 
 }  // namespace util

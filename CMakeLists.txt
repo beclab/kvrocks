@@ -18,7 +18,9 @@
 cmake_minimum_required(VERSION 3.16)
 project(kvrocks
         DESCRIPTION "NoSQL which is based on RocksDB and compatible with the Redis protocol"
-        LANGUAGES CXX)
+        LANGUAGES C CXX)
+
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 
 option(DISABLE_JEMALLOC "disable use of the jemalloc library" OFF)
 option(ENABLE_ASAN "enable address sanitizer" OFF)
@@ -28,38 +30,41 @@ option(ASAN_WITH_LSAN "enable leak sanitizer while address sanitizer is enabled"
 option(ENABLE_STATIC_LIBSTDCXX "link kvrocks with static library of libstd++ instead of shared library" ON)
 option(ENABLE_LUAJIT "enable use of luaJIT instead of lua" ON)
 option(ENABLE_OPENSSL "enable openssl to support tls connection" OFF)
-option(ENABLE_IPO "enable interprocedural optimization" ON)
-option(ENABLE_UNWIND "enable libunwind in glog" ON)
-option(ENABLE_SPEEDB "enable speedb instead of rocksdb" OFF)
+option(ENABLE_LTO "enable link-time optimization" ON)
+set(SYMBOLIZE_BACKEND "" CACHE STRING "symbolization backend library for cpptrace (libbacktrace, libdwarf, or empty)")
 set(PORTABLE 0 CACHE STRING "build a portable binary (disable arch-specific optimizations)")
-# TODO: set ENABLE_NEW_ENCODING to ON when we are ready
 option(ENABLE_NEW_ENCODING "enable new encoding (#1033) for storing 64bit size and expire time in milliseconds" ON)
+
+# to save build time in debug mode
+if (CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set(ENABLE_LTO OFF)
+endif()
 
 if (CMAKE_VERSION VERSION_GREATER_EQUAL "3.24.0")
     cmake_policy(SET CMP0135 NEW)
 endif()
 
-find_package(Backtrace REQUIRED)
-
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 7)
-        message(FATAL_ERROR "It is expected to build kvrocks with GCC 7 or above")
+    if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 8)
+        message(FATAL_ERROR "It is expected to build kvrocks with GCC 8 or above")
     endif()
 elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-    if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 5)
-        message(FATAL_ERROR "It is expected to build kvrocks with Clang 5 or above")
+    if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9)
+        message(FATAL_ERROR "It is expected to build kvrocks with Clang 9 or above")
     endif()
 elseif(CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
-    if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 10)
-        message(FATAL_ERROR "It is expected to build kvrocks with Xcode toolchains 10 or above")
+    if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 11)
+        message(FATAL_ERROR "It is expected to build kvrocks with Xcode toolchains 11 or above")
     endif()
 else()
     message(WARNING "The compiler you are currently using is not officially supported,
-        so you can try switching to GCC>=7 or Clang>=5 if you encounter problems")
+        so you can try switching to GCC>=8 or Clang>=8 if you encounter problems")
 endif()
 
 if(CMAKE_GENERATOR STREQUAL "Ninja")
     set(MAKE_COMMAND make)
+    set(NINJA_MAKE_JOBS 4 CACHE STRING "specify concurrent level while ninja calling make")
+    set(NINJA_MAKE_JOBS_FLAG -j${NINJA_MAKE_JOBS})
 else()
     set(MAKE_COMMAND $(MAKE))
 endif()
@@ -135,7 +140,7 @@ endif()
 
 if (CMAKE_HOST_APPLE)
     set(DISABLE_JEMALLOC ON)
-    set(ENABLE_IPO OFF)
+    set(ENABLE_LTO OFF)
 endif ()
 
 if(NOT DISABLE_JEMALLOC)
@@ -149,26 +154,41 @@ if(ENABLE_OPENSSL)
     find_package(OpenSSL REQUIRED)
 endif()
 
+# Auto-detect macOS SDK path if not set
+if(APPLE AND NOT CMAKE_OSX_SYSROOT)
+  execute_process(
+    COMMAND xcrun --sdk macosx --show-sdk-path
+    OUTPUT_VARIABLE MACOS_SDK_PATH
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+    RESULT_VARIABLE result
+  )
+
+  if(result EQUAL 0 AND EXISTS "${MACOS_SDK_PATH}")
+    set(CMAKE_OSX_SYSROOT "${MACOS_SDK_PATH}" CACHE PATH "macOS SDK path" FORCE)
+  else()
+    message(FATAL_ERROR "Failed to detect macOS SDK path. "
+            "Install Xcode command line tools or set CMAKE_OSX_SYSROOT manually.")
+  endif()
+endif()
+
 include(cmake/gtest.cmake)
-include(cmake/glog.cmake)
 include(cmake/snappy.cmake)
 include(cmake/lz4.cmake)
 include(cmake/zlib.cmake)
 include(cmake/zstd.cmake)
 include(cmake/tbb.cmake)
-if(ENABLE_SPEEDB)
-    include(cmake/speedb.cmake)
-else()
-    include(cmake/rocksdb.cmake)
-endif()
+include(cmake/rocksdb.cmake)
 include(cmake/libevent.cmake)
 include(cmake/fmt.cmake)
+include(cmake/spdlog.cmake)
 include(cmake/jsoncons.cmake)
 include(cmake/xxhash.cmake)
 include(cmake/span.cmake)
 include(cmake/trie.cmake)
 include(cmake/pegtl.cmake)
 include(cmake/rangev3.cmake)
+include(cmake/cpptrace.cmake)
 
 if (ENABLE_LUAJIT)
     include(cmake/luajit.cmake)
@@ -178,7 +198,6 @@ endif()
 
 find_package(Threads REQUIRED)
 
-list(APPEND EXTERNAL_LIBS glog)
 list(APPEND EXTERNAL_LIBS snappy)
 list(APPEND EXTERNAL_LIBS rocksdb_with_headers)
 list(APPEND EXTERNAL_LIBS event_with_headers)
@@ -186,6 +205,7 @@ list(APPEND EXTERNAL_LIBS lz4)
 list(APPEND EXTERNAL_LIBS zstd)
 list(APPEND EXTERNAL_LIBS zlib_with_headers)
 list(APPEND EXTERNAL_LIBS fmt)
+list(APPEND EXTERNAL_LIBS spdlog)
 if (ENABLE_LUAJIT)
     list(APPEND EXTERNAL_LIBS luajit)
 else()
@@ -203,6 +223,7 @@ list(APPEND EXTERNAL_LIBS span-lite)
 list(APPEND EXTERNAL_LIBS tsl_hat_trie)
 list(APPEND EXTERNAL_LIBS pegtl)
 list(APPEND EXTERNAL_LIBS range-v3)
+list(APPEND EXTERNAL_LIBS cpptrace::cpptrace)
 
 # Add git sha to version.h
 find_package(Git REQUIRED)
@@ -242,6 +263,7 @@ add_library(kvrocks_objs OBJECT ${KVROCKS_SRCS})
 target_include_directories(kvrocks_objs PUBLIC src src/common src/vendor ${PROJECT_BINARY_DIR} ${Backtrace_INCLUDE_DIR})
 target_compile_features(kvrocks_objs PUBLIC cxx_std_17)
 target_compile_options(kvrocks_objs PUBLIC -Wall -Wpedantic -Wsign-compare -Wreturn-type -fno-omit-frame-pointer)
+target_compile_options(kvrocks_objs PUBLIC -Werror=unused-parameter)
 target_compile_options(kvrocks_objs PUBLIC -Werror=unused-result)
 
 # disable unused-variable check on GCC < 8 due to the structure bindings
@@ -259,11 +281,7 @@ elseif((CMAKE_CXX_COMPILER_ID STREQUAL "Clang") OR (CMAKE_CXX_COMPILER_ID STREQU
 endif()
 target_link_libraries(kvrocks_objs PUBLIC -fno-omit-frame-pointer)
 target_link_libraries(kvrocks_objs PUBLIC ${EXTERNAL_LIBS})
-if (ENABLE_SPEEDB)
-    target_compile_definitions(kvrocks_objs PUBLIC KVROCKS_STORAGE_ENGINE=Speedb)
-else()
-    target_compile_definitions(kvrocks_objs PUBLIC KVROCKS_STORAGE_ENGINE=RocksDB)
-endif()
+target_compile_definitions(kvrocks_objs PUBLIC KVROCKS_STORAGE_ENGINE=RocksDB)
 if(ENABLE_OPENSSL)
     target_compile_definitions(kvrocks_objs PUBLIC ENABLE_OPENSSL)
 endif()
@@ -275,10 +293,10 @@ endif()
 
 # disable LTO on GCC <= 9 due to an ICE
 if((CMAKE_CXX_COMPILER_ID STREQUAL "GNU") AND (CMAKE_CXX_COMPILER_VERSION VERSION_LESS 10))
-    set(ENABLE_IPO OFF)
+    set(ENABLE_LTO OFF)
 endif()
 
-if(ENABLE_IPO)
+if(ENABLE_LTO)
     include(CheckIPOSupported)
     check_ipo_supported(RESULT ipo_result OUTPUT ipo_output LANGUAGES CXX)
 
@@ -288,7 +306,7 @@ if(ENABLE_IPO)
             target_link_libraries(kvrocks_objs PUBLIC "-fuse-ld=lld")
         endif()
     else()
-        message(WARNING "IPO is not supported: ${ipo_output}")
+        message(WARNING "LTO is not supported: ${ipo_output}")
     endif()
 endif()
 

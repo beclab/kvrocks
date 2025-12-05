@@ -88,7 +88,7 @@ struct CommandParser {
   std::enable_if_t<IsRandomAccessIter, size_t> Remains() const {
     // O(1) iff Iter is random access iterator.
     auto d = std::distance(begin_, end_);
-    DCHECK(d >= 0);
+    CHECK(d >= 0);
     return d;
   }
 
@@ -177,3 +177,6 @@ CommandParser(const Container&, size_t = 0) -> CommandParser<typename Container:
 
 template <typename Container>
 CommandParser(Container&&, size_t = 0) -> CommandParser<MoveIterator<typename Container::iterator>>;
+
+template <typename Container>
+using CommandParserFromConst = CommandParser<typename Container::const_iterator>;

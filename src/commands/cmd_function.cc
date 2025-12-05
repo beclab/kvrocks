@@ -22,14 +22,16 @@
 #include "commands/command_parser.h"
 #include "parse_util.h"
 #include "server/redis_reply.h"
+#include "server/server.h"
 #include "storage/scripting.h"
 #include "string_util.h"
 
 namespace redis {
 
 struct CommandFunction : Commander {
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     CommandParser parser(args_, 1);
+
     if (parser.EatEqICase("load")) {
       bool replace = false;
       if (parser.EatEqICase("replace")) {
@@ -37,7 +39,7 @@ struct CommandFunction : Commander {
       }
 
       std::string libname;
-      auto s = lua::FunctionLoad(conn, GET_OR_RET(parser.TakeStr()), true, replace, &libname);
+      auto s = lua::FunctionLoad(conn, &ctx, GET_OR_RET(parser.TakeStr()), true, replace, &libname);
       if (!s) return s;
 
       *output = SimpleString(libname);
@@ -53,28 +55,37 @@ struct CommandFunction : Commander {
         with_code = true;
       }
 
-      return lua::FunctionList(srv, conn, libname, with_code, output);
+      return lua::FunctionList(srv, conn, ctx, libname, with_code, output);
     } else if (parser.EatEqICase("listfunc")) {
       std::string funcname;
       if (parser.EatEqICase("funcname")) {
         funcname = GET_OR_RET(parser.TakeStr());
       }
 
-      return lua::FunctionListFunc(srv, conn, funcname, output);
+      return lua::FunctionListFunc(srv, conn, ctx, funcname, output);
     } else if (parser.EatEqICase("listlib")) {
       auto libname = GET_OR_RET(parser.TakeStr().Prefixed("expect a library name"));
 
-      return lua::FunctionListLib(srv, conn, libname, output);
+      return lua::FunctionListLib(conn, libname, output);
     } else if (parser.EatEqICase("delete")) {
       auto libname = GET_OR_RET(parser.TakeStr());
-      if (!lua::FunctionIsLibExist(conn, libname)) {
+      if (!lua::FunctionIsLibExist(conn, &ctx, libname)) {
         return {Status::NotOK, "no such library"};
       }
-
-      auto s = lua::FunctionDelete(srv, libname);
+      auto s = lua::FunctionDelete(ctx, conn, libname);
+      if (!s) return s;
+      s = srv->Propagate(engine::kPropagateScriptCommand, args_);
       if (!s) return s;
 
-      *output = SimpleString("OK");
+      *output = RESP_OK;
+      return Status::OK();
+    } else if (parser.EatEqICase("flush")) {
+      auto s = lua::FunctionFlush(conn, &ctx);
+      if (!s) return s;
+      s = srv->Propagate(engine::kPropagateScriptCommand, args_);
+      if (!s) return s;
+
+      *output = RESP_OK;
       return Status::OK();
     } else {
       return {Status::NotOK, "no such subcommand"};
@@ -84,7 +95,8 @@ struct CommandFunction : Commander {
 
 template <bool read_only = false>
 struct CommandFCall : Commander {
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute([[maybe_unused]] engine::Context &ctx, [[maybe_unused]] Server *srv, Connection *conn,
+                 std::string *output) override {
     int64_t numkeys = GET_OR_RET(ParseInt<int64_t>(args_[2], 10));
     if (numkeys > int64_t(args_.size() - 3)) {
       return {Status::NotOK, "Number of keys can't be greater than number of args"};
@@ -92,7 +104,8 @@ struct CommandFCall : Commander {
       return {Status::NotOK, "Number of keys can't be negative"};
     }
 
-    return lua::FunctionCall(conn, args_[1], std::vector<std::string>(args_.begin() + 3, args_.begin() + 3 + numkeys),
+    return lua::FunctionCall(conn, &ctx, args_[1],
+                             std::vector<std::string>(args_.begin() + 3, args_.begin() + 3 + numkeys),
                              std::vector<std::string>(args_.begin() + 3 + numkeys, args_.end()), output, read_only);
   }
 };
@@ -100,17 +113,24 @@ struct CommandFCall : Commander {
 CommandKeyRange GetScriptEvalKeyRange(const std::vector<std::string> &args);
 
 uint64_t GenerateFunctionFlags(uint64_t flags, const std::vector<std::string> &args) {
-  if (util::EqualICase(args[1], "load") || util::EqualICase(args[1], "delete")) {
+  if (args.size() >= 2 && (util::EqualICase(args[1], "load") || util::EqualICase(args[1], "delete"))) {
     return flags | kCmdWrite;
   }
 
   return flags;
 }
 
-REDIS_REGISTER_COMMANDS(MakeCmdAttr<CommandFunction>("function", -2, "exclusive no-script", 0, 0, 0,
-                                                     GenerateFunctionFlags),
-                        MakeCmdAttr<CommandFCall<>>("fcall", -3, "exclusive write no-script", GetScriptEvalKeyRange),
-                        MakeCmdAttr<CommandFCall<true>>("fcall_ro", -3, "read-only ro-script no-script",
-                                                        GetScriptEvalKeyRange));
+uint64_t GenerateFCallFlags(uint64_t flags, const std::vector<std::string> &, const Config &config) {
+  if (!config.lua_strict_key_accessing) {
+    return flags | kCmdExclusive;
+  }
+
+  return flags;
+}
+
+REDIS_REGISTER_COMMANDS(
+    Function, MakeCmdAttr<CommandFunction>("function", -2, "exclusive no-script", NO_KEY, GenerateFunctionFlags),
+    MakeCmdAttr<CommandFCall<>>("fcall", -3, "write no-script skip-monitor", GetScriptEvalKeyRange, GenerateFCallFlags),
+    MakeCmdAttr<CommandFCall<true>>("fcall_ro", -3, "read-only no-script skip-monitor", GetScriptEvalKeyRange));
 
 }  // namespace redis

@@ -22,6 +22,7 @@ package config
 import (
 	"context"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -36,7 +37,9 @@ import (
 )
 
 func TestRenameCommand(t *testing.T) {
+	t.Parallel()
 	srv := util.StartServer(t, map[string]string{
+		"resp3-enabled":       "no",
 		"rename-command KEYS": "KEYSNEW",
 		"rename-command GET":  "GETNEW",
 		"rename-command SET":  "SETNEW",
@@ -61,6 +64,7 @@ func TestRenameCommand(t *testing.T) {
 }
 
 func TestSetConfigBackupDir(t *testing.T) {
+	t.Parallel()
 	configs := map[string]string{}
 	srv := util.StartServer(t, configs)
 	defer srv.Close()
@@ -71,10 +75,8 @@ func TestSetConfigBackupDir(t *testing.T) {
 
 	originBackupDir := filepath.Join(configs["dir"], "backup")
 
-	r := rdb.Do(ctx, "CONFIG", "GET", "backup-dir")
-	rList := r.Val().([]interface{})
-	require.EqualValues(t, rList[0], "backup-dir")
-	require.EqualValues(t, rList[1], originBackupDir)
+	r := rdb.ConfigGet(ctx, "backup-dir").Val()
+	require.EqualValues(t, r["backup-dir"], originBackupDir)
 
 	hasCompactionFiles := func(dir string) bool {
 		if _, err := os.Stat(dir); os.IsNotExist(err) {
@@ -98,14 +100,11 @@ func TestSetConfigBackupDir(t *testing.T) {
 
 	require.False(t, hasCompactionFiles(newBackupDir))
 
-	require.NoError(t, rdb.Do(ctx, "CONFIG", "SET", "backup-dir", newBackupDir).Err())
+	require.NoError(t, rdb.ConfigSet(ctx, "backup-dir", newBackupDir).Err())
+	r = rdb.ConfigGet(ctx, "backup-dir").Val()
+	require.EqualValues(t, r["backup-dir"], newBackupDir)
 
-	r = rdb.Do(ctx, "CONFIG", "GET", "backup-dir")
-	rList = r.Val().([]interface{})
-	require.EqualValues(t, rList[0], "backup-dir")
-	require.EqualValues(t, rList[1], newBackupDir)
-
-	require.NoError(t, rdb.Do(ctx, "bgsave").Err())
+	require.NoError(t, rdb.BgSave(ctx).Err())
 	time.Sleep(2000 * time.Millisecond)
 
 	require.True(t, hasCompactionFiles(newBackupDir))
@@ -113,6 +112,7 @@ func TestSetConfigBackupDir(t *testing.T) {
 }
 
 func TestConfigSetCompression(t *testing.T) {
+	t.Parallel()
 	configs := map[string]string{}
 	srv := util.StartServer(t, configs)
 	defer srv.Close()
@@ -134,6 +134,7 @@ func TestConfigSetCompression(t *testing.T) {
 }
 
 func TestConfigGetRESP3(t *testing.T) {
+	t.Parallel()
 	srv := util.StartServer(t, map[string]string{
 		"resp3-enabled": "yes",
 	})
@@ -147,6 +148,7 @@ func TestConfigGetRESP3(t *testing.T) {
 }
 
 func TestStartWithoutConfigurationFile(t *testing.T) {
+	t.Parallel()
 	srv := util.StartServerWithCLIOptions(t, false, map[string]string{}, []string{})
 	defer srv.Close()
 
@@ -159,6 +161,7 @@ func TestStartWithoutConfigurationFile(t *testing.T) {
 }
 
 func TestDynamicChangeWorkerThread(t *testing.T) {
+	t.Parallel()
 	configs := map[string]string{}
 	srv := util.StartServer(t, configs)
 	defer srv.Close()
@@ -243,5 +246,211 @@ func TestDynamicChangeWorkerThread(t *testing.T) {
 		// requests after changing worker threads.
 		require.NoError(t, rdb.Set(ctx, "foo", "bar", 0).Err())
 		require.Equal(t, "bar", rdb.Get(ctx, "foo").Val())
+	})
+}
+
+func TestChangeProtoMaxBulkLen(t *testing.T) {
+	t.Parallel()
+	configs := map[string]string{}
+	srv := util.StartServer(t, configs)
+	defer srv.Close()
+
+	ctx := context.Background()
+	rdb := srv.NewClient()
+	defer func() { require.NoError(t, rdb.Close()) }()
+
+	// Default value is 512MB
+	vals, err := rdb.ConfigGet(ctx, "proto-max-bulk-len").Result()
+	require.NoError(t, err)
+	require.EqualValues(t, "536870912", vals["proto-max-bulk-len"])
+
+	// Change to 2MB
+	require.NoError(t, rdb.ConfigSet(ctx, "proto-max-bulk-len", "2097152").Err())
+	vals, err = rdb.ConfigGet(ctx, "proto-max-bulk-len").Result()
+	require.NoError(t, err)
+	require.EqualValues(t, "2097152", vals["proto-max-bulk-len"])
+
+	// change to 100MB
+	require.NoError(t, rdb.ConfigSet(ctx, "proto-max-bulk-len", "100M").Err())
+	vals, err = rdb.ConfigGet(ctx, "proto-max-bulk-len").Result()
+	require.NoError(t, err)
+	require.EqualValues(t, "104857600", vals["proto-max-bulk-len"])
+
+	// Must be >= 1MB
+	require.Error(t, rdb.ConfigSet(ctx, "proto-max-bulk-len", "1024").Err())
+}
+
+func TestGetConfigTxnContext(t *testing.T) {
+	t.Parallel()
+	srv := util.StartServer(t, map[string]string{
+		"txn-context-enabled": "yes",
+	})
+	defer srv.Close()
+
+	ctx := context.Background()
+	rdb := srv.NewClient()
+	defer func() { require.NoError(t, rdb.Close()) }()
+	val := rdb.ConfigGet(ctx, "txn-context-enabled").Val()
+	require.EqualValues(t, "yes", val["txn-context-enabled"])
+
+	// default value "no"
+	srv1 := util.StartServer(t, map[string]string{})
+	defer srv1.Close()
+
+	rdb = srv1.NewClient()
+	val = rdb.ConfigGet(ctx, "txn-context-enabled").Val()
+	require.EqualValues(t, "no", val["txn-context-enabled"])
+}
+
+func TestGenerateConfigsMatrix(t *testing.T) {
+	t.Parallel()
+	configOptions := []util.ConfigOptions{
+		{
+			Name:       "txn-context-enabled",
+			Options:    []string{"yes", "no"},
+			ConfigType: util.YesNo,
+		},
+		{
+			Name:       "resp3-enabled",
+			Options:    []string{"yes", "no"},
+			ConfigType: util.YesNo,
+		},
+	}
+
+	configsMatrix, err := util.GenerateConfigsMatrix(configOptions)
+
+	require.NoError(t, err)
+	require.Equal(t, 4, len(configsMatrix))
+	require.Contains(t, configsMatrix, util.KvrocksServerConfigs{"txn-context-enabled": "yes", "resp3-enabled": "yes"})
+	require.Contains(t, configsMatrix, util.KvrocksServerConfigs{"txn-context-enabled": "yes", "resp3-enabled": "no"})
+	require.Contains(t, configsMatrix, util.KvrocksServerConfigs{"txn-context-enabled": "no", "resp3-enabled": "yes"})
+	require.Contains(t, configsMatrix, util.KvrocksServerConfigs{"txn-context-enabled": "no", "resp3-enabled": "no"})
+}
+
+func TestGetConfigSkipBlockCacheDeallocationOnClose(t *testing.T) {
+	t.Parallel()
+	srv := util.StartServer(t, map[string]string{
+		"skip-block-cache-deallocation-on-close": "yes",
+	})
+	defer srv.Close()
+
+	ctx := context.Background()
+	rdb := srv.NewClient()
+	defer func() { require.NoError(t, rdb.Close()) }()
+	val := rdb.ConfigGet(ctx, "skip-block-cache-deallocation-on-close").Val()
+	require.EqualValues(t, "yes", val["skip-block-cache-deallocation-on-close"])
+
+	// default value "no"
+	srv1 := util.StartServer(t, map[string]string{})
+	defer srv1.Close()
+
+	rdb = srv1.NewClient()
+	val = rdb.ConfigGet(ctx, "skip-block-cache-deallocation-on-close").Val()
+	require.EqualValues(t, "no", val["skip-block-cache-deallocation-on-close"])
+}
+
+func TestConfigRocksDBOptions(t *testing.T) {
+	t.Parallel()
+	srv := util.StartServer(t, map[string]string{})
+	defer srv.Close()
+
+	rdb := srv.NewClient()
+	defer func() { require.NoError(t, rdb.Close()) }()
+
+	t.Run("Get and Set rocksdb.max_compaction_bytes", func(t *testing.T) {
+		ctx := context.Background()
+		parameter := "rocksdb.max_compaction_bytes"
+		result, err := rdb.ConfigGet(ctx, parameter).Result()
+		require.NoError(t, err)
+		require.EqualValues(t, "0", result[parameter])
+
+		util.ErrorRegexp(t, rdb.ConfigSet(ctx, parameter, "-1").Err(), ".*out of numeric range")
+
+		require.NoError(t, rdb.ConfigSet(ctx, parameter, "1073741824").Err())
+		result, err = rdb.ConfigGet(ctx, parameter).Result()
+		require.NoError(t, err)
+		require.EqualValues(t, "1073741824", result[parameter])
+	})
+}
+
+func TestConfigSstFileDeleteRateBytesPerSec(t *testing.T) {
+	t.Parallel()
+	srv := util.StartServer(t, map[string]string{})
+	defer srv.Close()
+
+	cli := srv.NewClient()
+	defer func() { require.NoError(t, cli.Close()) }()
+
+	t.Run("Get and Set rocksdb.sst_file_delete_rate_bytes_per_sec", func(t *testing.T) {
+		ctx := context.Background()
+		parameter := "rocksdb.sst_file_delete_rate_bytes_per_sec"
+		result, err := cli.ConfigGet(ctx, parameter).Result()
+		require.NoError(t, err)
+		require.EqualValues(t, "0", result[parameter])
+
+		util.ErrorRegexp(t, cli.ConfigSet(ctx, parameter, "-1").Err(), ".*out of numeric range")
+
+		require.NoError(t, cli.ConfigSet(ctx, parameter, "1073741824").Err())
+		result, err = cli.ConfigGet(ctx, parameter).Result()
+		require.NoError(t, err)
+		require.EqualValues(t, "1073741824", result[parameter])
+	})
+}
+
+func TestConfigPeriodicCompactionSecondsAndTTL(t *testing.T) {
+	t.Parallel()
+	srv := util.StartServer(t, map[string]string{})
+	defer srv.Close()
+
+	cli := srv.NewClient()
+	defer func() { require.NoError(t, cli.Close()) }()
+
+	testTemplate := func(t *testing.T, field string) func(*testing.T) {
+		return func(*testing.T) {
+			ctx := context.Background()
+			parameter := field
+			result, err := cli.ConfigGet(ctx, parameter).Result()
+			require.NoError(t, err)
+			require.EqualValues(t, strconv.FormatUint(math.MaxUint64-1, 10), result[parameter])
+
+			util.ErrorRegexp(t, cli.ConfigSet(ctx, parameter, "-1").Err(), ".*not started as an integer")
+
+			require.NoError(t, cli.ConfigSet(ctx, parameter, strconv.FormatUint(math.MaxUint64, 10)).Err())
+			result, err = cli.ConfigGet(ctx, parameter).Result()
+			require.NoError(t, err)
+			require.EqualValues(t, strconv.FormatUint(math.MaxUint64, 10), result[parameter])
+		}
+	}
+
+	t.Run("Get and Set rocksdb.periodic_compaction_seconds", testTemplate(t, "rocksdb.periodic_compaction_seconds"))
+	t.Run("Get and Set rocksdb.ttl", testTemplate(t, "rocksdb.ttl"))
+}
+
+func TestConfigDailyOffpeakTimeUTC(t *testing.T) {
+	t.Parallel()
+	srv := util.StartServer(t, map[string]string{})
+	defer srv.Close()
+
+	cli := srv.NewClient()
+	defer func() { require.NoError(t, cli.Close()) }()
+
+	t.Run("Get and Set rocksdb.daily_offpeak_time_utc", func(t *testing.T) {
+		ctx := context.Background()
+		parameter := "rocksdb.daily_offpeak_time_utc"
+		result, err := cli.ConfigGet(ctx, parameter).Result()
+		require.NoError(t, err)
+		require.EqualValues(t, "", result[parameter])
+
+		util.ErrorRegexp(t, cli.ConfigSet(ctx, parameter, "VALUE").Err(), ".*Invalid argument.*")
+
+		require.NoError(t, cli.ConfigSet(ctx, parameter, "00:00-00:30").Err())
+		result, err = cli.ConfigGet(ctx, parameter).Result()
+		require.NoError(t, err)
+		require.EqualValues(t, "00:00-00:30", result[parameter])
+
+		require.NoError(t, cli.ConfigSet(ctx, parameter, "").Err())
+		result, err = cli.ConfigGet(ctx, parameter).Result()
+		require.NoError(t, err)
+		require.EqualValues(t, "", result[parameter])
 	})
 }

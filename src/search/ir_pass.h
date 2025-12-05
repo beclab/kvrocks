@@ -20,6 +20,8 @@
 
 #pragma once
 
+#include <string_view>
+
 #include "ir.h"
 #include "search/ir_plan.h"
 
@@ -28,6 +30,7 @@ namespace kqir {
 struct Pass {
   virtual std::unique_ptr<Node> Transform(std::unique_ptr<Node> node) = 0;
 
+  virtual std::string_view Name() = 0;
   virtual void Reset() {}
 
   virtual ~Pass() = default;
@@ -59,6 +62,12 @@ struct Visitor : Pass {
       return Visit(std::move(v));
     } else if (auto v = Node::As<TagContainExpr>(std::move(node))) {
       return Visit(std::move(v));
+    } else if (auto v = Node::As<VectorLiteral>(std::move(node))) {
+      return Visit(std::move(v));
+    } else if (auto v = Node::As<VectorKnnExpr>(std::move(node))) {
+      return Visit(std::move(v));
+    } else if (auto v = Node::As<VectorRangeExpr>(std::move(node))) {
+      return Visit(std::move(v));
     } else if (auto v = Node::As<StringLiteral>(std::move(node))) {
       return Visit(std::move(v));
     } else if (auto v = Node::As<BoolLiteral>(std::move(node))) {
@@ -69,6 +78,10 @@ struct Visitor : Pass {
       return Visit(std::move(v));
     } else if (auto v = Node::As<TagFieldScan>(std::move(node))) {
       return Visit(std::move(v));
+    } else if (auto v = Node::As<HnswVectorFieldRangeScan>(std::move(node))) {
+      return Visit(std::move(v));
+    } else if (auto v = Node::As<HnswVectorFieldKnnScan>(std::move(node))) {
+      return Visit(std::move(v));
     } else if (auto v = Node::As<Filter>(std::move(node))) {
       return Visit(std::move(v));
     } else if (auto v = Node::As<Limit>(std::move(node))) {
@@ -77,7 +90,7 @@ struct Visitor : Pass {
       return Visit(std::move(v));
     } else if (auto v = Node::As<Sort>(std::move(node))) {
       return Visit(std::move(v));
-    } else if (auto v = Node::As<TopNSort>(std::move(node))) {
+    } else if (auto v = Node::As<TopN>(std::move(node))) {
       return Visit(std::move(v));
     } else if (auto v = Node::As<Projection>(std::move(node))) {
       return Visit(std::move(v));
@@ -85,7 +98,7 @@ struct Visitor : Pass {
       return Visit(std::move(v));
     }
 
-    __builtin_unreachable();
+    unreachable();
   }
 
   template <typename T>
@@ -125,6 +138,8 @@ struct Visitor : Pass {
 
   virtual std::unique_ptr<Node> Visit(std::unique_ptr<NumericLiteral> node) { return node; }
 
+  virtual std::unique_ptr<Node> Visit(std::unique_ptr<VectorLiteral> node) { return node; }
+
   virtual std::unique_ptr<Node> Visit(std::unique_ptr<NumericCompareExpr> node) {
     node->field = VisitAs<FieldRef>(std::move(node->field));
     node->num = VisitAs<NumericLiteral>(std::move(node->num));
@@ -134,6 +149,19 @@ struct Visitor : Pass {
   virtual std::unique_ptr<Node> Visit(std::unique_ptr<TagContainExpr> node) {
     node->field = VisitAs<FieldRef>(std::move(node->field));
     node->tag = VisitAs<StringLiteral>(std::move(node->tag));
+    return node;
+  }
+
+  virtual std::unique_ptr<Node> Visit(std::unique_ptr<VectorKnnExpr> node) {
+    node->field = VisitAs<FieldRef>(std::move(node->field));
+    node->vector = VisitAs<VectorLiteral>(std::move(node->vector));
+    return node;
+  }
+
+  virtual std::unique_ptr<Node> Visit(std::unique_ptr<VectorRangeExpr> node) {
+    node->field = VisitAs<FieldRef>(std::move(node->field));
+    node->range = VisitAs<NumericLiteral>(std::move(node->range));
+    node->vector = VisitAs<VectorLiteral>(std::move(node->vector));
     return node;
   }
 
@@ -173,6 +201,10 @@ struct Visitor : Pass {
 
   virtual std::unique_ptr<Node> Visit(std::unique_ptr<TagFieldScan> node) { return node; }
 
+  virtual std::unique_ptr<Node> Visit(std::unique_ptr<HnswVectorFieldRangeScan> node) { return node; }
+
+  virtual std::unique_ptr<Node> Visit(std::unique_ptr<HnswVectorFieldKnnScan> node) { return node; }
+
   virtual std::unique_ptr<Node> Visit(std::unique_ptr<Filter> node) {
     node->source = TransformAs<PlanOperator>(std::move(node->source));
     node->filter_expr = TransformAs<QueryExpr>(std::move(node->filter_expr));
@@ -191,7 +223,7 @@ struct Visitor : Pass {
     return node;
   }
 
-  virtual std::unique_ptr<Node> Visit(std::unique_ptr<TopNSort> node) {
+  virtual std::unique_ptr<Node> Visit(std::unique_ptr<TopN> node) {
     node->op = TransformAs<PlanOperator>(std::move(node->op));
     node->limit = VisitAs<LimitClause>(std::move(node->limit));
     node->order = VisitAs<SortByClause>(std::move(node->order));

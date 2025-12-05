@@ -21,10 +21,12 @@
 #pragma once
 
 #include <rocksdb/status.h>
+#include <sys/time.h>
 
 #include <atomic>
 #include <bitset>
 #include <initializer_list>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -49,8 +51,15 @@ enum RedisType : uint8_t {
   kRedisStream = 8,
   kRedisBloomFilter = 9,
   kRedisJson = 10,
-  kRedisSearch = 11,
+  kRedisHyperLogLog = 11,
+  kRedisTDigest = 12,
+  kRedisTimeSeries = 13,
+  kRedisTypeMax
 };
+
+inline constexpr const std::array<std::string_view, kRedisTypeMax> RedisTypeNames = {
+    "none",      "string", "hash",      "list",      "set",         "zset",      "bitmap",
+    "sortedint", "stream", "MBbloom--", "ReJSON-RL", "hyperloglog", "TDIS-TYPE", "timeseries"};
 
 struct RedisTypes {
   RedisTypes(std::initializer_list<RedisType> list) {
@@ -91,9 +100,6 @@ enum RedisCommand {
   kRedisCmdLMove,
 };
 
-const std::vector<std::string> RedisTypeNames = {"none",   "string",    "hash",   "list",      "set",      "zset",
-                                                 "bitmap", "sortedint", "stream", "MBbloom--", "ReJSON-RL"};
-
 constexpr const char *kErrMsgWrongType = "WRONGTYPE Operation against a key holding the wrong kind of value";
 constexpr const char *kErrMsgKeyExpired = "the key was expired";
 
@@ -111,6 +117,7 @@ template <typename T = Slice>
 [[nodiscard]] std::tuple<T, T> ExtractNamespaceKey(Slice ns_key, bool slot_id_encoded);
 [[nodiscard]] std::string ComposeNamespaceKey(const Slice &ns, const Slice &key, bool slot_id_encoded);
 [[nodiscard]] std::string ComposeSlotKeyPrefix(const Slice &ns, int slotid);
+[[nodiscard]] std::string ComposeSlotKeyUpperBound(const Slice &ns, int slotid);
 
 class InternalKey {
  public:
@@ -171,6 +178,7 @@ class Metadata {
   void PutExpire(std::string *dst) const;
 
   RedisType Type() const;
+  std::string_view TypeName() const;
   size_t CommonEncodedSize() const;
   int64_t TTL() const;
   timeval Time() const;
@@ -315,16 +323,88 @@ class JsonMetadata : public Metadata {
   rocksdb::Status Decode(Slice *input) override;
 };
 
-enum class SearchOnDataType : uint8_t {
-  HASH = kRedisHash,
-  JSON = kRedisJson,
+class HyperLogLogMetadata : public Metadata {
+ public:
+  enum class EncodeType : uint8_t {
+    // Redis-style dense encoding implement as bitmap like sub keys to
+    // store registers by segment in data column family.
+    // The registers are stored in 6-bit format and each segment contains
+    // 768 registers.
+    DENSE = 0,
+    // TODO(mwish): sparse encoding
+    // SPARSE = 1,
+  };
+
+  explicit HyperLogLogMetadata(bool generate_version = true) : Metadata(kRedisHyperLogLog, generate_version) {}
+
+  void Encode(std::string *dst) const override;
+  rocksdb::Status Decode(Slice *input) override;
+
+  EncodeType encode_type = EncodeType::DENSE;
 };
 
-class SearchMetadata : public Metadata {
+class TDigestMetadata : public Metadata {
  public:
-  SearchOnDataType on_data_type;
+  uint32_t compression;
+  uint32_t capacity;
+  uint64_t unmerged_nodes = 0;
+  uint64_t merged_nodes = 0;
+  uint64_t total_weight = 0;
+  uint64_t merged_weight = 0;
+  double minimum = std::numeric_limits<double>::max();
+  double maximum = std::numeric_limits<double>::lowest();
+  uint64_t total_observations = 0;  // reserved for TDIGEST.INFO command
+  uint64_t merge_times = 0;         // reserved for TDIGEST.INFO command
 
-  explicit SearchMetadata(bool generate_version = true) : Metadata(kRedisSearch, generate_version) {}
+  explicit TDigestMetadata(uint32_t compression, uint32_t capacity, bool generate_version = true)
+      : Metadata(kRedisTDigest, generate_version), compression(compression), capacity(capacity) {}
+  explicit TDigestMetadata(bool generate_version = true) : TDigestMetadata(0, 0, generate_version) {}
+  void Encode(std::string *dst) const override;
+  rocksdb::Status Decode(Slice *input) override;
+
+  uint64_t TotalNodes() const { return merged_nodes + unmerged_nodes; }
+
+  double Delta() const { return 1. / static_cast<double>(compression); }
+};
+
+class TimeSeriesMetadata : public Metadata {
+ public:
+  enum class ChunkType : uint8_t {
+    UNCOMPRESSED = 0,
+    COMPRESSED = 1,
+  };
+
+  enum class DuplicatePolicy : uint8_t {
+    BLOCK = 0,
+    FIRST = 1,
+    LAST = 2,
+    MIN = 3,
+    MAX = 4,
+    SUM = 5,
+  };
+
+  uint64_t retention_time;
+  uint64_t chunk_size;
+  ChunkType chunk_type;
+  DuplicatePolicy duplicate_policy;
+  std::string source_key;
+  uint64_t last_timestamp = 0;  // Approximate last timestamp, used for compaction filter
+
+  explicit TimeSeriesMetadata(bool generate_version = true)
+      : Metadata(kRedisTimeSeries, generate_version),
+        retention_time(0),
+        chunk_size(0),
+        chunk_type(ChunkType::UNCOMPRESSED),
+        duplicate_policy(DuplicatePolicy::BLOCK) {}
+  TimeSeriesMetadata(uint64_t retention_time, uint64_t chunk_size, ChunkType chunk_type,
+                     DuplicatePolicy duplicate_policy, bool generate_version = true)
+      : Metadata(kRedisTimeSeries, generate_version),
+        retention_time(retention_time),
+        chunk_size(chunk_size),
+        chunk_type(chunk_type),
+        duplicate_policy(duplicate_policy) {}
+
+  void SetSourceKey(Slice key);
 
   void Encode(std::string *dst) const override;
   rocksdb::Status Decode(Slice *input) override;

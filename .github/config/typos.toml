@@ -20,6 +20,11 @@ extend-exclude = [
     ".git/",
     "src/vendor/",
     "tests/gocase/util/slot.go",
+    
+    # Uses short strings for testing glob matching
+    "tests/cppunit/string_util_test.cc",
+    "tests/gocase/unit/keyspace/keyspace_test.go",
+    "tests/gocase/unit/scan/scan_test.go",
 ]
 ignore-hidden = false
 
@@ -33,3 +38,12 @@ ignore-hidden = false
 
 # jsoncons
 "ser" = "ser"
+
+#Comments in WATCH command test
+"hed" = "hed"
+
+#Used as a short naming into tests
+"typ" = "typ"
+
+#Fix name (Yann Collet)
+"Collet" = "Collet"

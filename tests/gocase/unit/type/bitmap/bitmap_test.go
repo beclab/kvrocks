@@ -48,7 +48,7 @@ const (
 func Set2SetBit(t *testing.T, rdb *redis.Client, ctx context.Context, key string, bs []byte) {
 	buf := bytes.NewBuffer([]byte{})
 	for _, v := range bs {
-		buf.WriteString(fmt.Sprintf("%08b", v))
+		_, _ = fmt.Fprintf(buf, "%08b", v)
 	}
 	for index, value := range buf.String() {
 		require.NoError(t, rdb.SetBit(ctx, key, int64(index), int(value)-int('0')).Err())
@@ -74,7 +74,7 @@ func SimulateBitOp(op BITOP, values ...[]byte) string {
 	for _, value := range values {
 		buf := bytes.NewBuffer([]byte{})
 		for _, v := range value {
-			buf.WriteString(fmt.Sprintf("%08b", v))
+			_, _ = fmt.Fprintf(buf, "%08b", v)
 		}
 		tmp := buf.String() + strings.Repeat("0", maxlen-len(buf.String()))
 		binaryArray = append(binaryArray, tmp)
@@ -534,13 +534,13 @@ func TestBitmap(t *testing.T) {
 
 	t.Run("BITPOS bit=1 fuzzy testing using SETBIT", func(t *testing.T) {
 		require.NoError(t, rdb.Del(ctx, "str").Err())
-		var max int64 = 524288
+		var maxInt int64 = 524288
 		var firstOnePos int64 = -1
 		for j := 0; j < 1000; j++ {
 			cmd := rdb.BitPosSpan(ctx, "str", 1, 0, -1, "bit")
 			require.NoError(t, cmd.Err())
 			require.EqualValues(t, firstOnePos, cmd.Val())
-			pos := util.RandomInt(max)
+			pos := util.RandomInt(maxInt)
 			require.NoError(t, rdb.SetBit(ctx, "str", int64(pos), 1).Err())
 			if firstOnePos == -1 || firstOnePos > pos {
 				firstOnePos = pos
@@ -549,18 +549,18 @@ func TestBitmap(t *testing.T) {
 	})
 
 	t.Run("BITPOS bit=0 fuzzy testing using SETBIT", func(t *testing.T) {
-		var max int64 = 524288
-		firstZeroPos := max
-		require.NoError(t, rdb.Set(ctx, "str", strings.Repeat("\xff", int(max/8)), 0).Err())
+		var maxInt int64 = 524288
+		firstZeroPos := maxInt
+		require.NoError(t, rdb.Set(ctx, "str", strings.Repeat("\xff", int(maxInt/8)), 0).Err())
 		for j := 0; j < 1000; j++ {
 			cmd := rdb.BitPosSpan(ctx, "str", 0, 0, -1, "bit")
 			require.NoError(t, cmd.Err())
-			if firstZeroPos == max {
+			if firstZeroPos == maxInt {
 				require.EqualValues(t, -1, cmd.Val())
 			} else {
 				require.EqualValues(t, firstZeroPos, cmd.Val())
 			}
-			pos := util.RandomInt(max)
+			pos := util.RandomInt(maxInt)
 			require.NoError(t, rdb.SetBit(ctx, "str", int64(pos), 0).Err())
 			if firstZeroPos > pos {
 				firstZeroPos = pos

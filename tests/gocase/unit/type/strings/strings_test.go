@@ -35,6 +35,22 @@ import (
 )
 
 func TestString(t *testing.T) {
+	configOptions := []util.ConfigOptions{
+		{
+			Name:       "txn-context-enabled",
+			Options:    []string{"yes", "no"},
+			ConfigType: util.YesNo,
+		},
+	}
+
+	configsMatrix, err := util.GenerateConfigsMatrix(configOptions)
+	require.NoError(t, err)
+
+	for _, configs := range configsMatrix {
+		testString(t, configs)
+	}
+}
+func testString(t *testing.T, configs util.KvrocksServerConfigs) {
 	srv := util.StartServer(t, map[string]string{})
 	defer srv.Close()
 	ctx := context.Background()
@@ -362,7 +378,7 @@ func TestString(t *testing.T) {
 	t.Run("SETBIT with out of range bit offset", func(t *testing.T) {
 		require.NoError(t, rdb.Del(ctx, "mykey").Err())
 		require.ErrorContains(t, rdb.SetBit(ctx, "mykey", 4*1024*1024*1024+2, 1).Err(), "out of range")
-		require.ErrorContains(t, rdb.SetBit(ctx, "mykey", -1, 1).Err(), "out of range")
+		require.ErrorContains(t, rdb.SetBit(ctx, "mykey", -1, 1).Err(), "an integer")
 	})
 
 	t.Run("SETBIT with non-bit argument", func(t *testing.T) {
@@ -482,6 +498,23 @@ func TestString(t *testing.T) {
 		require.NoError(t, rdb.Del(ctx, "mykey").Err())
 		require.NoError(t, rdb.LPush(ctx, "mykey", "foo").Err())
 		require.ErrorContains(t, rdb.SetRange(ctx, "mykey", 0, "bar").Err(), "WRONGTYPE")
+	})
+
+	t.Run("SETRANGE with negative offset", func(t *testing.T) {
+		require.ErrorContains(t, rdb.SetRange(ctx, "setrange_negative_offset", -1, "bar").Err(),
+			"value is not an integer or out of range")
+		require.ErrorContains(t, rdb.SetRange(ctx, "setrange_negative_offset", -2147483599, "bar").Err(),
+			"value is not an integer or out of range")
+	})
+
+	t.Run("SETRANGE with offset + value length too large", func(t *testing.T) {
+		protoMaxBulkLen := int64(1024 * 1024)
+		require.NoError(t, rdb.ConfigSet(ctx, "proto-max-bulk-len", strconv.FormatInt(protoMaxBulkLen, 10)).Err())
+		require.ErrorContains(t, rdb.SetRange(ctx, "setrange_out_of_range", protoMaxBulkLen, "world").Err(),
+			"string exceeds maximum allowed size")
+
+		// it should be able to set the value if the length is protoMaxBulkLen
+		require.NoError(t, rdb.SetRange(ctx, "setrange_out_of_range", protoMaxBulkLen-5, "world").Err())
 	})
 
 	t.Run("GETRANGE against non-existing key", func(t *testing.T) {

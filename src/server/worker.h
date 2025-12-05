@@ -27,7 +27,6 @@
 
 #include <cstdint>
 #include <cstring>
-#include <iostream>
 #include <lua.hpp>
 #include <map>
 #include <memory>
@@ -36,9 +35,9 @@
 #include <utility>
 #include <vector>
 
+#include "config/config.h"
 #include "event_util.h"
 #include "redis_connection.h"
-#include "storage/storage.h"
 
 class Server;
 
@@ -75,10 +74,14 @@ class Worker : EventCallbackBase<Worker>, EvconnlistenerBase<Worker> {
   void TimerCB(int, int16_t events);
 
   lua_State *Lua() { return lua_; }
+  void LuaReset();
+  int64_t GetLuaMemorySize();
+
   std::map<int, redis::Connection *> GetConnections() const { return conns_; }
   Server *srv;
 
  private:
+  Status listenFD(int fd, uint32_t expected_port, int backlog);
   Status listenTCP(const std::string &host, uint32_t port, int backlog);
   void newTCPConnection(evconnlistener *listener, evutil_socket_t fd, sockaddr *address, int socklen);
   void newUnixSocketConnection(evconnlistener *listener, evutil_socket_t fd, sockaddr *address, int socklen);
@@ -95,7 +98,7 @@ class Worker : EventCallbackBase<Worker>, EvconnlistenerBase<Worker> {
 
   struct bufferevent_rate_limit_group *rate_limit_group_ = nullptr;
   struct ev_token_bucket_cfg *rate_limit_group_cfg_ = nullptr;
-  lua_State *lua_;
+  std::atomic<lua_State *> lua_;
   std::atomic<bool> is_terminated_ = false;
 };
 

@@ -21,48 +21,60 @@ package log
 
 import (
 	"os"
+	"strings"
 	"testing"
-	"time"
 
 	"github.com/apache/kvrocks/tests/gocase/util"
 	"github.com/stretchr/testify/require"
 )
 
-func TestLogClean(t *testing.T) {
-	err := os.Mkdir("/tmp/kvrocks/logfile", os.ModePerm)
-	if err != nil {
-		return
-	}
-	srv1 := util.StartServer(t, map[string]string{
-		"log-dir":            "/tmp/kvrocks/logfile",
-		"log-retention-days": "0",
+const infoLogFileNamePart = ".log"
+
+func TestInfoLogClean(t *testing.T) {
+	t.Skip("the new log system does not support zero log-retention-days for immediately removing all log files")
+
+	logDir := "/tmp/kvrocks/logfile"
+	require.NoError(t, os.RemoveAll(logDir))
+	require.NoError(t, os.MkdirAll(logDir, os.ModePerm))
+
+	srv := util.StartServer(t, map[string]string{
+		"log-dir":            logDir,
+		"log-retention-days": "-1",
 	})
-	srv1.Close()
-	files1, _ := os.ReadDir("/tmp/kvrocks/logfile")
-	time.Sleep(2000 * time.Millisecond)
-	srv2 := util.StartServer(t, map[string]string{
-		"log-dir":            "/tmp/kvrocks/logfile",
-		"log-retention-days": "0",
+	srv.CloseWithoutCleanup()
+
+	logInfoFiles := getInfoLogFilesInDir(t, logDir)
+	require.NotEmpty(t, logInfoFiles)
+
+	srv = util.StartServer(t, map[string]string{
+		"log-dir":            logDir,
+		"log-retention-days": "0", // all previous INFO level logs should be immediately removed
 	})
-	srv2.Close()
-	files2, _ := os.ReadDir("/tmp/kvrocks/logfile")
-	islogclear := false
-	for _, f1 := range files1 {
-		ishave := false
-		for _, f2 := range files2 {
-			if f1.Name() == f2.Name() {
-				ishave = true
-				break
-			}
+	defer srv.Close()
+
+	logInfoFiles = getInfoLogFilesInDir(t, logDir)
+	require.Empty(t, logInfoFiles) // the log directory doesn't contain any INFO level log files
+}
+
+func getInfoLogFilesInDir(t *testing.T, dir string) []os.DirEntry {
+	t.Helper()
+
+	files, err := os.ReadDir(dir)
+	require.NoError(t, err)
+
+	infoLogFiles := make([]os.DirEntry, 0, len(files))
+
+	for _, f := range files {
+		if !f.Type().IsRegular() {
+			continue
 		}
-		if !ishave {
-			islogclear = true
-			break
+
+		if !strings.Contains(f.Name(), infoLogFileNamePart) {
+			continue
 		}
+
+		infoLogFiles = append(infoLogFiles, f)
 	}
-	require.Equal(t, true, islogclear)
-	err = os.RemoveAll("/tmp/kvrocks/logfile")
-	if err != nil {
-		return
-	}
+
+	return infoLogFiles
 }

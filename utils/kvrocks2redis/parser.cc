@@ -20,13 +20,13 @@
 
 #include "parser.h"
 
-#include <glog/logging.h>
 #include <rocksdb/write_batch.h>
 
 #include <memory>
 
 #include "cluster/redis_slot.h"
 #include "db_util.h"
+#include "logging.h"
 #include "server/redis_reply.h"
 #include "storage/redis_metadata.h"
 #include "types/redis_string.h"
@@ -94,7 +94,8 @@ Status Parser::parseComplexKV(const Slice &ns_key, const Metadata &metadata) {
   read_options.iterate_upper_bound = &upper_bound;
 
   std::string output;
-  auto iter = util::UniqueIterator(storage_, read_options);
+  auto no_txn_ctx = engine::Context::NoTransactionContext(storage_);
+  auto iter = util::UniqueIterator(no_txn_ctx, read_options);
   for (iter->Seek(prefix_key); iter->Valid(); iter->Next()) {
     if (!iter->key().starts_with(prefix_key)) {
       break;
@@ -177,7 +178,7 @@ Status Parser::ParseWriteBatch(const std::string &batch_string) {
   for (const auto &iter : *resp_commands) {
     auto s = writer_->Write(iter.first, iter.second);
     if (!s.IsOK()) {
-      LOG(ERROR) << "[kvrocks2redis] Failed to write to AOF from the write batch. Error: " << s.Msg();
+      error("Failed to write to AOF from the write batch. Error: {}", s.Msg());
     }
   }
 

@@ -140,8 +140,6 @@ func TestTLS(t *testing.T) {
 }
 
 func TestTLSReplica(t *testing.T) {
-	t.Skip("FIXME: flaky test with a high frequency of failure")
-
 	if !util.TLSEnable() {
 		t.Skip("TLS tests run only if tls enabled.")
 	}
@@ -172,7 +170,7 @@ func TestTLSReplica(t *testing.T) {
 		require.Equal(t, rc.Get(ctx, "b").Val(), "")
 		require.NoError(t, sc.Set(ctx, "a", "1", 0).Err())
 		require.NoError(t, sc.Set(ctx, "b", "2", 0).Err())
-		util.WaitForOffsetSync(t, sc, rc)
+		util.WaitForOffsetSync(t, sc, rc, 5*time.Second)
 		require.Equal(t, rc.Get(ctx, "a").Val(), "1")
 		require.Equal(t, rc.Get(ctx, "b").Val(), "2")
 	})
@@ -189,7 +187,7 @@ func TestTLSReplica(t *testing.T) {
 	defer func() { require.NoError(t, rc2.Close()) }()
 
 	t.Run("TLS: Replication (full)", func(t *testing.T) {
-		util.WaitForOffsetSync(t, sc, rc2)
+		util.WaitForOffsetSync(t, sc, rc2, 5*time.Second)
 		require.Equal(t, rc2.Get(ctx, "a").Val(), "1")
 		require.Equal(t, rc2.Get(ctx, "b").Val(), "2")
 		require.Equal(t, rc2.Get(ctx, "c").Val(), "3")

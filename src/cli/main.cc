@@ -18,6 +18,7 @@
  *
  */
 
+#include "spdlog/common.h"
 #ifdef __linux__
 #define _XOPEN_SOURCE 700  // NOLINT
 #else
@@ -25,31 +26,31 @@
 #endif
 
 #include <event2/thread.h>
-#include <glog/logging.h>
 
 #include <iomanip>
+#include <memory>
 #include <ostream>
 
-#include "config.h"
 #include "daemon_util.h"
 #include "io_util.h"
+#include "logging.h"
 #include "pid_util.h"
 #include "scope_exit.h"
 #include "server/server.h"
 #include "signal_util.h"
+#include "spdlog/sinks/daily_file_sink.h"
+#include "spdlog/sinks/stdout_color_sinks.h"
 #include "storage/storage.h"
 #include "string_util.h"
 #include "time_util.h"
-#include "unique_fd.h"
 #include "vendor/crc64.h"
-#include "version.h"
 #include "version_util.h"
 
 Server *srv = nullptr;
 
 extern "C" void SignalHandler(int sig) {
   if (srv && !srv->IsStopped()) {
-    LOG(INFO) << "Bye Bye";
+    info("Signal {} ({}) received, stopping the server", strsignal(sig), sig);
     srv->Stop();
   }
 }
@@ -61,12 +62,10 @@ struct NewOpt {
 static void PrintUsage(const char *program) {
   std::cout << program << " implements the Redis protocol based on rocksdb" << std::endl
             << "Usage:" << std::endl
-            << std::left << new_opt << "-c, --config <filename>"
-            << "set config file to <filename>, or `-` for stdin" << std::endl
-            << new_opt << "-v, --version"
-            << "print version information" << std::endl
-            << new_opt << "-h, --help"
-            << "print this help message" << std::endl
+            << std::left << new_opt << "-c, --config <filename>" << "set config file to <filename>, or `-` for stdin"
+            << std::endl
+            << new_opt << "-v, --version" << "print version information" << std::endl
+            << new_opt << "-h, --help" << "print this help message" << std::endl
             << new_opt << "--<config-key> <config-value>"
             << "overwrite specific config option <config-key> to <config-value>" << std::endl;
 }
@@ -79,7 +78,7 @@ static CLIOptions ParseCommandLineOptions(int argc, char **argv) {
     if ((argv[i] == "-c"sv || argv[i] == "--config"sv) && i + 1 < argc) {
       opts.conf_file = argv[++i];
     } else if (argv[i] == "-v"sv || argv[i] == "--version"sv) {
-      std::cout << "kvrocks " << PrintVersion << std::endl;
+      std::cout << "kvrocks " << PrintVersion() << std::endl;
       std::exit(0);
     } else if (argv[i] == "-h"sv || argv[i] == "--help"sv) {
       PrintUsage(*argv);
@@ -96,31 +95,51 @@ static CLIOptions ParseCommandLineOptions(int argc, char **argv) {
   return opts;
 }
 
-static void InitGoogleLog(const Config *config) {
-  FLAGS_minloglevel = config->log_level;
-  FLAGS_max_log_size = 100;
-  FLAGS_logbufsecs = 0;
+static Status InitSpdlog(const Config &config) {
+  std::vector<spdlog::sink_ptr> sinks;
 
-  if (util::EqualICase(config->log_dir, "stdout")) {
-    for (int level = google::INFO; level <= google::FATAL; level++) {
-      google::SetLogDestination(level, "");
+  // NOTE: to be compatible with old behaviors, we allow negative log_retention_days (-1)
+  auto retention_days = config.log_retention_days < 0 ? 0 : config.log_retention_days;
+
+  for (const auto &i : util::Split(config.log_dir, ",")) {
+    auto item = util::Trim(i, " ");
+    auto vals = util::Split(item, ":");
+    if (vals.empty()) {
+      return {Status::NotOK, "cannot get valid directory in config option log-dir"};
     }
-    FLAGS_stderrthreshold = google::ERROR;
-    FLAGS_logtostdout = true;
-    std::setbuf(stdout, nullptr);
-  } else {
-    FLAGS_log_dir = config->log_dir + "/";
-    if (config->log_retention_days != -1) {
-      google::EnableLogCleaner(config->log_retention_days);
+
+    auto dir = vals[0];
+    auto level_str = vals.size() >= 2 ? vals[1] : "info";
+    auto it = std::find_if(log_levels.begin(), log_levels.end(), [&](const auto &v) { return v.name == level_str; });
+    if (it == log_levels.end()) {
+      return {Status::NotOK, "failed to set log level with config option log-dir"};
     }
+    auto level = it->val;
+
+    if (util::EqualICase(dir, "stdout")) {
+      sinks.push_back(std::make_shared<spdlog::sinks::stdout_color_sink_mt>());
+    } else if (util::EqualICase(dir, "stderr")) {
+      sinks.push_back(std::make_shared<spdlog::sinks::stderr_color_sink_mt>());
+    } else {
+      sinks.push_back(
+          std::make_shared<spdlog::sinks::daily_file_sink_mt>(dir + "/kvrocks.log", 0, 0, false, retention_days));
+    }
+
+    sinks.back()->set_level(level);
   }
+
+  auto logger = std::make_shared<spdlog::logger>("kvrocks", sinks.begin(), sinks.end());
+  logger->set_level(config.log_level);
+  logger->set_pattern("[%Y-%m-%dT%H:%M:%S.%f%z][%^%L%$][%s:%#] %v");
+  logger->flush_on(spdlog::level::info);
+  spdlog::set_default_logger(logger);
+
+  return Status::OK();
 }
 
 int main(int argc, char *argv[]) {
   srand(static_cast<unsigned>(util::GetTimeStamp()));
-
-  google::InitGoogleLogging("kvrocks");
-  auto glog_exit = MakeScopeExit(google::ShutdownGoogleLogging);
+  crc64_init();
 
   evthread_use_pthreads();
   auto event_exit = MakeScopeExit(libevent_global_shutdown);
@@ -136,18 +155,25 @@ int main(int argc, char *argv[]) {
     std::cout << "Failed to load config. Error: " << s.Msg() << std::endl;
     return 1;
   }
+  const auto socket_fd_exit = MakeScopeExit([&config] {
+    if (config.socket_fd != -1) {
+      close(config.socket_fd);
+    }
+  });
 
-  crc64_init();
-  InitGoogleLog(&config);
-  LOG(INFO) << "kvrocks " << PrintVersion;
+  if (auto s = InitSpdlog(config); !s) {
+    std::cout << "Failed to initialize logging system. Error: " << s.Msg() << std::endl;
+    return 1;
+  }
+  info("kvrocks {}", PrintVersion());
   // Tricky: We don't expect that different instances running on the same port,
   // but the server use REUSE_PORT to support the multi listeners. So we connect
   // the listen port to check if the port has already listened or not.
-  if (!config.binds.empty()) {
+  if (config.socket_fd == -1 && !config.binds.empty()) {
     uint32_t ports[] = {config.port, config.tls_port, 0};
     for (uint32_t *port = ports; *port; ++port) {
       if (util::IsPortInUse(*port)) {
-        LOG(ERROR) << "Could not create server TCP since the specified port[" << *port << "] is already in use";
+        error("Could not create the server since the specified port {} is already in use", *port);
         return 1;
       }
     }
@@ -156,7 +182,7 @@ int main(int argc, char *argv[]) {
   if (config.daemonize && !is_supervised) Daemonize();
   s = CreatePidFile(config.pidfile);
   if (!s.IsOK()) {
-    LOG(ERROR) << "Failed to create pidfile: " << s.Msg();
+    error("Failed to create pidfile: {}", s.Msg());
     return 1;
   }
   auto pidfile_exit = MakeScopeExit([&config] { RemovePidFile(config.pidfile); });
@@ -171,14 +197,14 @@ int main(int argc, char *argv[]) {
   engine::Storage storage(&config);
   s = storage.Open();
   if (!s.IsOK()) {
-    LOG(ERROR) << "Failed to open: " << s.Msg();
+    error("Failed to open the database: {}", s.Msg());
     return 1;
   }
   Server server(&storage, &config);
   srv = &server;
   s = srv->Start();
   if (!s.IsOK()) {
-    LOG(ERROR) << "Failed to start server: " << s.Msg();
+    error("Failed to start server: {}", s.Msg());
     return 1;
   }
   srv->Join();

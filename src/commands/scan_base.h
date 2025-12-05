@@ -20,11 +20,14 @@
 
 #pragma once
 
+#include "cluster/redis_slot.h"
 #include "commander.h"
 #include "commands/command_parser.h"
 #include "error_constants.h"
+#include "glob.h"
 #include "parse_util.h"
 #include "server/server.h"
+#include "string_util.h"
 
 namespace redis {
 
@@ -44,11 +47,13 @@ class CommandScanBase : public Commander {
   Status ParseAdditionalFlags(Parser &parser) {
     while (parser.Good()) {
       if (parser.EatEqICase("match")) {
-        prefix_ = GET_OR_RET(parser.TakeStr());
-        if (!prefix_.empty() && prefix_.back() == '*') {
-          prefix_ = prefix_.substr(0, prefix_.size() - 1);
-        } else {
-          return {Status::RedisParseErr, "currently only key prefix matching is supported"};
+        const std::string glob_pattern = GET_OR_RET(parser.TakeStr());
+        if (const Status s = util::ValidateGlob(glob_pattern); !s.IsOK()) {
+          return {Status::RedisParseErr, "Invalid glob pattern: " + s.Msg()};
+        }
+        std::tie(prefix_, suffix_glob_) = util::SplitGlob(glob_pattern);
+        if (std::string_view tag = GetTagFromKey(glob_pattern); !tag.empty()) {
+          scan_slot_ = GetSlotIdFromKey(glob_pattern);
         }
       } else if (parser.EatEqICase("count")) {
         limit_ = GET_OR_RET(parser.TakeInt());
@@ -63,6 +68,8 @@ class CommandScanBase : public Commander {
         } else {
           return {Status::RedisExecErr, "Invalid type"};
         }
+      } else if (parser.EatEqICase("novalues")) {
+        no_values_ = true;
       } else {
         return parser.InvalidSyntax();
       }
@@ -80,7 +87,7 @@ class CommandScanBase : public Commander {
     }
   }
 
-  std::string GenerateOutput(Server *srv, const Connection *conn, const std::vector<std::string> &keys,
+  std::string GenerateOutput(Server *srv, [[maybe_unused]] const Connection *conn, const std::vector<std::string> &keys,
                              CursorType cursor_type) const {
     std::vector<std::string> list;
     if (keys.size() == static_cast<size_t>(limit_)) {
@@ -98,8 +105,11 @@ class CommandScanBase : public Commander {
  protected:
   std::string cursor_;
   std::string prefix_;
+  std::string suffix_glob_ = "*";
   int limit_ = 20;
   RedisType type_ = kRedisNone;
+  bool no_values_ = false;
+  std::optional<int> scan_slot_;
 };
 
 class CommandSubkeyScanBase : public CommandScanBase {

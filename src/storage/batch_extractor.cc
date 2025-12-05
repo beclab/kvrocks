@@ -20,9 +20,8 @@
 
 #include "batch_extractor.h"
 
-#include <glog/logging.h>
-
 #include "cluster/redis_slot.h"
+#include "logging.h"
 #include "parse_util.h"
 #include "server/redis_reply.h"
 #include "server/server.h"
@@ -38,7 +37,7 @@ void WriteBatchExtractor::LogData(const rocksdb::Slice &blob) {
   } else {
     // Redis type log data
     if (auto s = log_data_.Decode(blob); !s.IsOK()) {
-      LOG(WARNING) << "Failed to decode Redis type log: " << s.Msg();
+      warn("Failed to decode Redis type log: {}", s.Msg());
     }
   }
 }
@@ -53,7 +52,8 @@ rocksdb::Status WriteBatchExtractor::PutCF(uint32_t column_family_id, const Slic
 
   if (column_family_id == static_cast<uint32_t>(ColumnFamilyID::Metadata)) {
     std::tie(ns, user_key) = ExtractNamespaceKey<std::string>(key, is_slot_id_encoded_);
-    if (slot_id_ >= 0 && static_cast<uint16_t>(slot_id_) != GetSlotIdFromKey(user_key)) {
+    auto key_slot_id = GetSlotIdFromKey(user_key);
+    if (slot_range_.IsValid() && !slot_range_.Contains(key_slot_id)) {
       return rocksdb::Status::OK();
     }
 
@@ -63,6 +63,18 @@ rocksdb::Status WriteBatchExtractor::PutCF(uint32_t column_family_id, const Slic
 
     if (metadata.Type() == kRedisString) {
       command_args = {"SET", user_key, value.ToString().substr(Metadata::GetOffsetAfterExpire(value[0]))};
+      resp_commands_[ns].emplace_back(redis::ArrayOfBulkStrings(command_args));
+      if (metadata.expire > 0) {
+        command_args = {"PEXPIREAT", user_key, std::to_string(metadata.expire)};
+        resp_commands_[ns].emplace_back(redis::ArrayOfBulkStrings(command_args));
+      }
+    } else if (metadata.Type() == kRedisJson) {
+      JsonValue json_value;
+      s = redis::Json::FromRawString(value.ToString(), &json_value);
+      if (!s.ok()) return s;
+      auto json_bytes = json_value.Dump();
+      if (!json_bytes) return rocksdb::Status::Corruption(json_bytes.Msg());
+      command_args = {"JSON.SET", user_key, "$", json_bytes.GetValue()};
       resp_commands_[ns].emplace_back(redis::ArrayOfBulkStrings(command_args));
       if (metadata.expire > 0) {
         command_args = {"PEXPIREAT", user_key, std::to_string(metadata.expire)};
@@ -112,7 +124,8 @@ rocksdb::Status WriteBatchExtractor::PutCF(uint32_t column_family_id, const Slic
   if (column_family_id == static_cast<uint32_t>(ColumnFamilyID::PrimarySubkey)) {
     InternalKey ikey(key, is_slot_id_encoded_);
     user_key = ikey.GetKey().ToString();
-    if (slot_id_ >= 0 && static_cast<uint16_t>(slot_id_) != GetSlotIdFromKey(user_key)) {
+    auto key_slot_id = GetSlotIdFromKey(user_key);
+    if (slot_range_.IsValid() && !slot_range_.Contains(key_slot_id)) {
       return rocksdb::Status::OK();
     }
 
@@ -126,8 +139,7 @@ rocksdb::Status WriteBatchExtractor::PutCF(uint32_t column_family_id, const Slic
       case kRedisList: {
         auto args = log_data_.GetArguments();
         if (args->empty()) {
-          LOG(ERROR)
-              << "Failed to parse write_batch in PutCF. Type=List: no arguments, at least should contain a command";
+          error("Failed to parse write_batch in PutCF. Type=List: no arguments, at least should contain a command");
           return rocksdb::Status::OK();
         }
 
@@ -141,8 +153,9 @@ rocksdb::Status WriteBatchExtractor::PutCF(uint32_t column_family_id, const Slic
         switch (cmd) {
           case kRedisCmdLSet:
             if (args->size() < 2) {
-              LOG(ERROR) << "Failed to parse write_batch in PutCF. Command=LSET: no enough arguments, at least should "
-                            "contain an index";
+              error(
+                  "Failed to parse write_batch in PutCF. Command=LSET: no enough arguments, at least should contain an "
+                  "index");
               return rocksdb::Status::OK();
             }
 
@@ -151,8 +164,9 @@ rocksdb::Status WriteBatchExtractor::PutCF(uint32_t column_family_id, const Slic
           case kRedisCmdLInsert:
             if (first_seen_) {
               if (args->size() < 4) {
-                LOG(ERROR) << "Failed to parse write_batch in PutCF. Command=LINSERT: no enough arguments, should "
-                              "contain before pivot value";
+                error(
+                    "Failed to parse write_batch in PutCF. Command=LINSERT: no enough arguments, should contain before "
+                    "pivot values");
                 return rocksdb::Status::OK();
               }
 
@@ -173,8 +187,7 @@ rocksdb::Status WriteBatchExtractor::PutCF(uint32_t column_family_id, const Slic
             // LMOVE will be parsed in DeleteCF, so ignore it here
             break;
           default:
-            LOG(ERROR) << "Failed to parse write_batch in PutCF. Type=List: unhandled command with code "
-                       << *parse_result;
+            error("Failed to parse write_batch in PutCF. Type=List: unhandled command with code {}", *parse_result);
         }
         break;
       }
@@ -189,8 +202,7 @@ rocksdb::Status WriteBatchExtractor::PutCF(uint32_t column_family_id, const Slic
       case kRedisBitmap: {
         auto args = log_data_.GetArguments();
         if (args->empty()) {
-          LOG(ERROR)
-              << "Failed to parse write_batch in PutCF. Type=Bitmap: no arguments, at least should contain a command";
+          error("Failed to parse write_batch in PutCF. Type=Bitmap: no arguments, at least should contain a command");
           return rocksdb::Status::OK();
         }
 
@@ -204,8 +216,9 @@ rocksdb::Status WriteBatchExtractor::PutCF(uint32_t column_family_id, const Slic
         switch (cmd) {
           case kRedisCmdSetBit: {
             if (args->size() < 2) {
-              LOG(ERROR) << "Failed to parse write_batch in PutCF. Command=SETBIT: no enough arguments, should contain "
-                            "an offset";
+              error(
+                  "Failed to parse write_batch in PutCF. Command=SETBIT: no enough arguments, should contain an "
+                  "offset");
               return rocksdb::Status::OK();
             }
 
@@ -221,8 +234,9 @@ rocksdb::Status WriteBatchExtractor::PutCF(uint32_t column_family_id, const Slic
           case kRedisCmdBitOp:
             if (first_seen_) {
               if (args->size() < 4) {
-                LOG(ERROR) << "Failed to parse write_batch in PutCF. Command=BITOP: no enough arguments, at least "
-                              "should contain srckey";
+                error(
+                    "Failed to parse write_batch in PutCF. Command=BITOP: no enough arguments, at least should contain "
+                    "srckey");
                 return rocksdb::Status::OK();
               }
 
@@ -236,8 +250,7 @@ rocksdb::Status WriteBatchExtractor::PutCF(uint32_t column_family_id, const Slic
             command_args.insert(command_args.end(), args->begin() + 1, args->end());
             break;
           default:
-            LOG(ERROR) << "Failed to parse write_batch in PutCF. Type=Bitmap: unhandled command with code "
-                       << *parsed_cmd;
+            error("Failed to parse write_batch in PutCF. Type=Bitmap: unhandled command with code {}", *parsed_cmd);
             return rocksdb::Status::OK();
         }
         break;
@@ -255,7 +268,7 @@ rocksdb::Status WriteBatchExtractor::PutCF(uint32_t column_family_id, const Slic
   } else if (column_family_id == static_cast<uint32_t>(ColumnFamilyID::Stream)) {
     auto s = ExtractStreamAddCommand(is_slot_id_encoded_, key, value, &command_args);
     if (!s.IsOK()) {
-      LOG(ERROR) << "Failed to parse write_batch in PutCF. Type=Stream: " << s.Msg();
+      error("Failed to parse write_batch in PutCF. Type=Stream: {}", s.Msg());
       return rocksdb::Status::OK();
     }
   }
@@ -279,7 +292,8 @@ rocksdb::Status WriteBatchExtractor::DeleteCF(uint32_t column_family_id, const S
     std::string user_key;
     std::tie(ns, user_key) = ExtractNamespaceKey<std::string>(key, is_slot_id_encoded_);
 
-    if (slot_id_ >= 0 && static_cast<uint16_t>(slot_id_) != GetSlotIdFromKey(user_key)) {
+    auto key_slot_id = GetSlotIdFromKey(user_key);
+    if (slot_range_.IsValid() && !slot_range_.Contains(key_slot_id)) {
       return rocksdb::Status::OK();
     }
 
@@ -287,7 +301,8 @@ rocksdb::Status WriteBatchExtractor::DeleteCF(uint32_t column_family_id, const S
   } else if (column_family_id == static_cast<uint32_t>(ColumnFamilyID::PrimarySubkey)) {
     InternalKey ikey(key, is_slot_id_encoded_);
     std::string user_key = ikey.GetKey().ToString();
-    if (slot_id_ >= 0 && static_cast<uint16_t>(slot_id_) != GetSlotIdFromKey(user_key)) {
+    auto key_slot_id = GetSlotIdFromKey(user_key);
+    if (slot_range_.IsValid() && !slot_range_.Contains(key_slot_id)) {
       return rocksdb::Status::OK();
     }
 
@@ -307,8 +322,7 @@ rocksdb::Status WriteBatchExtractor::DeleteCF(uint32_t column_family_id, const S
       case kRedisList: {
         auto args = log_data_.GetArguments();
         if (args->empty()) {
-          LOG(ERROR)
-              << "Failed to parse write_batch in DeleteCF. Type=List: no arguments, at least should contain a command";
+          error("Failed to parse write_batch in DeleteCF. Type=List: no arguments, at least should contain a command");
           return rocksdb::Status::OK();
         }
 
@@ -323,8 +337,9 @@ rocksdb::Status WriteBatchExtractor::DeleteCF(uint32_t column_family_id, const S
           case kRedisCmdLTrim:
             if (first_seen_) {
               if (args->size() < 3) {
-                LOG(ERROR) << "Failed to parse write_batch in DeleteCF; Command=LTRIM: no enough arguments, should "
-                              "contain start and stop";
+                error(
+                    "Failed to parse write_batch in DeleteCF; Command=LTRIM: no enough arguments, should contain start "
+                    "and stop");
                 return rocksdb::Status::OK();
               }
 
@@ -335,8 +350,9 @@ rocksdb::Status WriteBatchExtractor::DeleteCF(uint32_t column_family_id, const S
           case kRedisCmdLRem:
             if (first_seen_) {
               if (args->size() < 3) {
-                LOG(ERROR) << "Failed to parse write_batch in DeleteCF. Command=LREM: no enough arguments, should "
-                              "contain count and value";
+                error(
+                    "Failed to parse write_batch in DeleteCF. Command=LREM: no enough arguments, should "
+                    "contain count and value");
                 return rocksdb::Status::OK();
               }
 
@@ -353,8 +369,9 @@ rocksdb::Status WriteBatchExtractor::DeleteCF(uint32_t column_family_id, const S
           case kRedisCmdLMove:
             if (first_seen_) {
               if (args->size() < 5) {
-                LOG(ERROR) << "Failed to parse write_batch in DeleteCF; Command=LMOVE: no enough arguments, should "
-                              "contain source, destination and where/from arguments";
+                error(
+                    "Failed to parse write_batch in DeleteCF; Command=LMOVE: no enough arguments, should "
+                    "contain source, destination and where/from arguments");
                 return rocksdb::Status::OK();
               }
               command_args = {"LMOVE", (*args)[1], (*args)[2], (*args)[3], (*args)[4]};
@@ -362,8 +379,7 @@ rocksdb::Status WriteBatchExtractor::DeleteCF(uint32_t column_family_id, const S
             }
             break;
           default:
-            LOG(ERROR) << "Failed to parse write_batch in DeleteCF. Type=List: unhandled command with code "
-                       << *parse_result;
+            error("Failed to parse write_batch in DeleteCF. Type=List: unhandled command with code {}", *parse_result);
         }
         break;
       }
@@ -392,8 +408,9 @@ rocksdb::Status WriteBatchExtractor::DeleteCF(uint32_t column_family_id, const S
   return rocksdb::Status::OK();
 }
 
-rocksdb::Status WriteBatchExtractor::DeleteRangeCF(uint32_t column_family_id, const Slice &begin_key,
-                                                   const Slice &end_key) {
+rocksdb::Status WriteBatchExtractor::DeleteRangeCF([[maybe_unused]] uint32_t column_family_id,
+                                                   [[maybe_unused]] const Slice &begin_key,
+                                                   [[maybe_unused]] const Slice &end_key) {
   // Do nothing with DeleteRange operations
   return rocksdb::Status::OK();
 }

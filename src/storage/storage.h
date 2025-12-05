@@ -21,6 +21,7 @@
 #pragma once
 
 #include <event2/bufferevent.h>
+#include <rocksdb/advanced_cache.h>
 #include <rocksdb/db.h>
 #include <rocksdb/options.h>
 #include <rocksdb/table.h>
@@ -30,6 +31,7 @@
 #include <atomic>
 #include <cinttypes>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <shared_mutex>
 #include <string>
@@ -40,11 +42,15 @@
 #include "config/config.h"
 #include "lock_manager.h"
 #include "observer_or_unique.h"
+#include "rocksdb/write_batch.h"
 #include "status.h"
+
+#if defined(__sparc__) || defined(__arm__)
+#define USE_ALIGNED_ACCESS
+#endif
 
 enum class StorageEngineType : uint16_t {
   RocksDB,
-  Speedb,
 };
 
 inline constexpr StorageEngineType STORAGE_ENGINE_TYPE = StorageEngineType::KVROCKS_STORAGE_ENGINE;
@@ -65,9 +71,10 @@ enum class ColumnFamilyID : uint32_t {
   Propagate,
   Stream,
   Search,
+  Index,
 };
 
-constexpr uint32_t kMaxColumnFamilyID = static_cast<uint32_t>(ColumnFamilyID::Search);
+constexpr uint32_t kMaxColumnFamilyID = static_cast<uint32_t>(ColumnFamilyID::Index);
 
 namespace engine {
 
@@ -88,6 +95,11 @@ inline const std::vector<CompressionOption> CompressionOptions = {
     {rocksdb::kSnappyCompression, "snappy", "kSnappyCompression"},
     {rocksdb::kZlibCompression, "zlib", "kZlibCompression"},
     {rocksdb::kLZ4Compression, "lz4", "kLZ4Compression"},
+    {rocksdb::kZSTD, "zstd", "kZSTD"},
+};
+
+inline const std::vector<CompressionOption> WalCompressionOptions = {
+    {rocksdb::kNoCompression, "no", "kNoCompression"},
     {rocksdb::kZSTD, "zstd", "kZSTD"},
 };
 
@@ -137,6 +149,7 @@ constexpr const std::string_view kPubSubColumnFamilyName = "pubsub";
 constexpr const std::string_view kPropagateColumnFamilyName = "propagate";
 constexpr const std::string_view kStreamColumnFamilyName = "stream";
 constexpr const std::string_view kSearchColumnFamilyName = "search";
+constexpr const std::string_view kIndexColumnFamilyName = "index";
 
 class ColumnFamilyConfigs {
  public:
@@ -175,6 +188,10 @@ class ColumnFamilyConfigs {
     return {ColumnFamilyID::Search, kSearchColumnFamilyName, /*is_minor=*/true};
   }
 
+  static ColumnFamilyConfig IndexColumnFamily() {
+    return {ColumnFamilyID::Index, kIndexColumnFamilyName, /*is_minor=*/true};
+  }
+
   /// ListAllColumnFamilies returns all column families in kvrocks.
   static const std::vector<ColumnFamilyConfig> &ListAllColumnFamilies() { return AllCfs; }
 
@@ -186,13 +203,15 @@ class ColumnFamilyConfigs {
   // Caution: don't change the order of column family, or the handle will be mismatched
   inline const static std::vector<ColumnFamilyConfig> AllCfs = {
       PrimarySubkeyColumnFamily(), MetadataColumnFamily(), SecondarySubkeyColumnFamily(), PubSubColumnFamily(),
-      PropagateColumnFamily(),     StreamColumnFamily(),   SearchColumnFamily(),
+      PropagateColumnFamily(),     StreamColumnFamily(),   SearchColumnFamily(),          IndexColumnFamily(),
   };
   inline const static std::vector<ColumnFamilyConfig> AllCfsWithoutDefault = {
-      MetadataColumnFamily(),  SecondarySubkeyColumnFamily(), PubSubColumnFamily(),
-      PropagateColumnFamily(), StreamColumnFamily(),          SearchColumnFamily(),
+      MetadataColumnFamily(), SecondarySubkeyColumnFamily(), PubSubColumnFamily(), PropagateColumnFamily(),
+      StreamColumnFamily(),   SearchColumnFamily(),          IndexColumnFamily(),
   };
 };
+
+struct Context;
 
 class Storage {
  public:
@@ -202,12 +221,14 @@ class Storage {
   void SetWriteOptions(const Config::RocksDB::WriteOptions &config);
   Status Open(DBOpenMode mode = kDBOpenModeDefault);
   void CloseDB();
+  void TrySkipBlockCacheDeallocationOnClose();
   bool IsEmptyDB();
   void EmptyDB();
   rocksdb::BlockBasedTableOptions InitTableOptions();
   void SetBlobDB(rocksdb::ColumnFamilyOptions *cf_options);
   rocksdb::Options InitRocksDBOptions();
   Status SetOptionForAllColumnFamilies(const std::string &key, const std::string &value);
+  Status SetOptionForAllColumnFamilies(const std::unordered_map<std::string, std::string> &options_map);
   Status SetDBOption(const std::string &key, const std::string &value);
   Status CreateColumnFamilies(const rocksdb::Options &options);
   // The sequence_number will be pointed to the value of the sequence number in range of DB,
@@ -218,37 +239,52 @@ class Storage {
   Status RestoreFromBackup();
   Status RestoreFromCheckpoint();
   Status GetWALIter(rocksdb::SequenceNumber seq, std::unique_ptr<rocksdb::TransactionLogIterator> *iter);
-  Status ReplicaApplyWriteBatch(std::string &&raw_batch);
+  Status ReplicaApplyWriteBatch(rocksdb::WriteBatch *batch, const rocksdb::WriteOptions &options);
   Status ApplyWriteBatch(const rocksdb::WriteOptions &options, std::string &&raw_batch);
   rocksdb::SequenceNumber LatestSeqNumber();
+  Status SyncWAL();
 
-  [[nodiscard]] rocksdb::Status Get(const rocksdb::ReadOptions &options, const rocksdb::Slice &key, std::string *value);
-  [[nodiscard]] rocksdb::Status Get(const rocksdb::ReadOptions &options, rocksdb::ColumnFamilyHandle *column_family,
+  [[nodiscard]] rocksdb::Status Get(engine::Context &ctx, const rocksdb::ReadOptions &options,
                                     const rocksdb::Slice &key, std::string *value);
-  [[nodiscard]] rocksdb::Status Get(const rocksdb::ReadOptions &options, const rocksdb::Slice &key,
-                                    rocksdb::PinnableSlice *value);
-  [[nodiscard]] rocksdb::Status Get(const rocksdb::ReadOptions &options, rocksdb::ColumnFamilyHandle *column_family,
+  [[nodiscard]] rocksdb::Status Get(engine::Context &ctx, const rocksdb::ReadOptions &options,
+                                    rocksdb::ColumnFamilyHandle *column_family, const rocksdb::Slice &key,
+                                    std::string *value);
+  [[nodiscard]] rocksdb::Status Get(engine::Context &ctx, const rocksdb::ReadOptions &options,
                                     const rocksdb::Slice &key, rocksdb::PinnableSlice *value);
-  void MultiGet(const rocksdb::ReadOptions &options, rocksdb::ColumnFamilyHandle *column_family, size_t num_keys,
-                const rocksdb::Slice *keys, rocksdb::PinnableSlice *values, rocksdb::Status *statuses);
-  rocksdb::Iterator *NewIterator(const rocksdb::ReadOptions &options, rocksdb::ColumnFamilyHandle *column_family);
-  rocksdb::Iterator *NewIterator(const rocksdb::ReadOptions &options);
+  [[nodiscard]] rocksdb::Status Get(engine::Context &ctx, const rocksdb::ReadOptions &options,
+                                    rocksdb::ColumnFamilyHandle *column_family, const rocksdb::Slice &key,
+                                    rocksdb::PinnableSlice *value);
+  void MultiGet(engine::Context &ctx, const rocksdb::ReadOptions &options, rocksdb::ColumnFamilyHandle *column_family,
+                size_t num_keys, const rocksdb::Slice *keys, rocksdb::PinnableSlice *values, rocksdb::Status *statuses);
+  rocksdb::Iterator *NewIterator(engine::Context &ctx, const rocksdb::ReadOptions &options,
+                                 rocksdb::ColumnFamilyHandle *column_family);
+  rocksdb::Iterator *NewIterator(engine::Context &ctx, const rocksdb::ReadOptions &options);
 
-  [[nodiscard]] rocksdb::Status Write(const rocksdb::WriteOptions &options, rocksdb::WriteBatch *updates);
-  const rocksdb::WriteOptions &DefaultWriteOptions() { return default_write_opts_; }
+  const rocksdb::WriteOptions &DefaultWriteOptions() const { return default_write_opts_; }
   rocksdb::ReadOptions DefaultScanOptions() const;
   rocksdb::ReadOptions DefaultMultiGetOptions() const;
-  [[nodiscard]] rocksdb::Status Delete(const rocksdb::WriteOptions &options, rocksdb::ColumnFamilyHandle *cf_handle,
-                                       const rocksdb::Slice &key);
-  [[nodiscard]] rocksdb::Status DeleteRange(const std::string &first_key, const std::string &last_key);
-  [[nodiscard]] rocksdb::Status FlushScripts(const rocksdb::WriteOptions &options,
+
+  [[nodiscard]] rocksdb::Status Write(engine::Context &ctx, const rocksdb::WriteOptions &options,
+                                      rocksdb::WriteBatch *updates);
+  [[nodiscard]] rocksdb::Status Delete(engine::Context &ctx, const rocksdb::WriteOptions &options,
+                                       rocksdb::ColumnFamilyHandle *cf_handle, const rocksdb::Slice &key);
+  [[nodiscard]] rocksdb::Status DeleteRange(engine::Context &ctx, const rocksdb::WriteOptions &options,
+                                            rocksdb::ColumnFamilyHandle *cf_handle, Slice begin, Slice end);
+  [[nodiscard]] rocksdb::Status DeleteRange(engine::Context &ctx, Slice begin, Slice end);
+  [[nodiscard]] rocksdb::Status FlushScripts(engine::Context &ctx, const rocksdb::WriteOptions &options,
                                              rocksdb::ColumnFamilyHandle *cf_handle);
   bool WALHasNewData(rocksdb::SequenceNumber seq) { return seq <= LatestSeqNumber(); }
   Status InWALBoundary(rocksdb::SequenceNumber seq);
-  Status WriteToPropagateCF(const std::string &key, const std::string &value);
+  Status WriteToPropagateCF(engine::Context &ctx, const std::string &key, const std::string &value);
 
   [[nodiscard]] rocksdb::Status Compact(rocksdb::ColumnFamilyHandle *cf, const rocksdb::Slice *begin,
                                         const rocksdb::Slice *end);
+  [[nodiscard]] rocksdb::Status FlushMemTable(rocksdb::ColumnFamilyHandle *cf_handle,
+                                              const rocksdb::FlushOptions &options);
+  [[nodiscard]] StatusOr<int> IngestSST(const std::string &folder,
+                                        const rocksdb::IngestExternalFileOptions &ingest_options);
+  void FlushBlockCache();
+
   rocksdb::DB *GetDB();
   bool IsClosing() const { return db_closing_; }
   std::string GetName() const { return config_->db_name; }
@@ -258,6 +294,7 @@ class Storage {
   LockManager *GetLockManager() { return &lock_mgr_; }
   void PurgeOldBackups(uint32_t num_backups_to_keep, uint32_t backup_max_keep_hours);
   uint64_t GetTotalSize(const std::string &ns = kDefaultNamespace);
+  void SetSstFileDeleteRateBytesPerSecond(int64_t delete_rate);
   void CheckDBSizeLimit();
   bool ReachedDBSizeLimit() { return db_size_limit_reached_; }
   void SetDBSizeLimit(bool limit) { db_size_limit_reached_ = limit; }
@@ -279,6 +316,7 @@ class Storage {
   Storage(const Storage &) = delete;
   Storage &operator=(const Storage &) = delete;
 
+  int GetWriteBatchMaxBytes() const { return config_->rocks_db.write_options.write_batch_max_bytes; }
   // Full replication data files manager
   class ReplDataManager {
    public:
@@ -318,7 +356,10 @@ class Storage {
   void SetDBInRetryableIOError(bool yes_or_no) { db_in_retryable_io_error_ = yes_or_no; }
   bool IsDBInRetryableIOError() const { return db_in_retryable_io_error_; }
 
-  Status ShiftReplId();
+  /// Redis PSYNC relies on a Unique Replication Sequence Id when use-rsid-psync
+  /// enabled.
+  /// ShiftReplId would generate an Id and write it to propagate cf.
+  Status ShiftReplId(engine::Context &ctx);
   std::string GetReplIdFromWalBySeq(rocksdb::SequenceNumber seq);
   std::string GetReplIdFromDbEngine();
 
@@ -345,6 +386,8 @@ class Storage {
 
   std::atomic<bool> db_in_retryable_io_error_{false};
 
+  // is_txn_mode_ is used to determine whether the current Storage is in transactional mode,
+  // .i.e, in "EXEC" command(CommandExec).
   std::atomic<bool> is_txn_mode_ = false;
   // txn_write_batch_ is used as the global write batch for the transaction mode,
   // all writes will be grouped in this write batch when entering the transaction mode,
@@ -354,10 +397,106 @@ class Storage {
   // command, so it won't have multi transactions to be executed at the same time.
   std::unique_ptr<rocksdb::WriteBatchWithIndex> txn_write_batch_;
 
-  rocksdb::WriteOptions default_write_opts_ = rocksdb::WriteOptions();
+  rocksdb::WriteOptions default_write_opts_;
 
-  rocksdb::Status writeToDB(const rocksdb::WriteOptions &options, rocksdb::WriteBatch *updates);
+  // rocksdb used global block cache
+  std::shared_ptr<rocksdb::Cache> shared_block_cache_;
+
+  rocksdb::Status writeToDB(engine::Context &ctx, const rocksdb::WriteOptions &options, rocksdb::WriteBatch *updates);
   void recordKeyspaceStat(const rocksdb::ColumnFamilyHandle *column_family, const rocksdb::Status &s);
+  Status applyWriteBatch(const rocksdb::WriteOptions &options, rocksdb::WriteBatch *batch);
+  rocksdb::Status ingestSST(rocksdb::ColumnFamilyHandle *cf_handle, const rocksdb::IngestExternalFileOptions &options,
+                            const std::vector<std::string> &sst_file_names);
+};
+
+/// Context passes fixed snapshot and batch between APIs
+///
+/// Limitations: Performing a large number of writes or apply operations like DeleteRange
+/// on the same Context may reduce performance.
+/// Please choose to use the same Context or create a new Context based on the actual
+/// situation.
+///
+/// Context does not provide thread safety guarantees and is generally only passed as a parameter between APIs.
+struct Context {
+  engine::Storage *storage = nullptr;
+
+  /// batch can be nullptr if
+  /// 1. The Context is not in transactional mode.
+  /// 2. The Context is in transactional mode, but no write operation is performed.
+  std::unique_ptr<rocksdb::WriteBatchWithIndex> batch = nullptr;
+
+  /// txn_context_enabled is used to determine whether the current Context is in transactional mode,
+  /// if it is not transactional mode, then Context is equivalent to a Storage.
+  /// If the configuration of txn-context-enabled is no, it is false.
+  bool txn_context_enabled = true;
+
+  /// NoTransactionContext returns a Context with a is_txn_mode of false
+  static Context NoTransactionContext(engine::Storage *storage) { return Context(storage, /*txn_mode=*/false); }
+
+  /// GetReadOptions returns a default ReadOptions, and if txn_context_enabled = true,
+  /// then its snapshot is specified by the Context.
+  /// Otherwise it is the same as Storage::DefaultReadOptions().
+  [[nodiscard]] rocksdb::ReadOptions GetReadOptions();
+  /// DefaultScanOptions returns a DefaultScanOptions, and if txn_context_enabled = true,
+  /// then its snapshot is specified by the Context.
+  /// Otherwise it is the same as Storage::DefaultScanOptions().
+  [[nodiscard]] rocksdb::ReadOptions DefaultScanOptions();
+  /// DefaultMultiGetOptions returns a DefaultMultiGetOptions, and if txn_context_enabled = true,
+  /// then its snapshot is specified by the Context.
+  /// Otherwise it is the same as Storage::DefaultMultiGetOptions
+  [[nodiscard]] rocksdb::ReadOptions DefaultMultiGetOptions();
+
+  void RefreshLatestSnapshot();
+
+  /// TODO: Change it to defer getting the context, and the snapshot is pinned after the first read operation
+  explicit Context(engine::Storage *storage)
+      : storage(storage), txn_context_enabled(storage->GetConfig()->txn_context_enabled) {}
+  ~Context() {
+    // A moved-from object doesn't have `storage`.
+    if (storage) {
+      if (snapshot_ && storage->GetDB()) {
+        storage->GetDB()->ReleaseSnapshot(snapshot_);
+      }
+    }
+  }
+  Context(const Context &) = delete;
+  Context &operator=(const Context &) = delete;
+  Context &operator=(Context &&ctx) noexcept {
+    if (this != &ctx) {
+      storage = ctx.storage;
+      snapshot_ = ctx.snapshot_;
+      batch = std::move(ctx.batch);
+
+      ctx.storage = nullptr;
+      ctx.snapshot_ = nullptr;
+    }
+    return *this;
+  }
+  Context(Context &&ctx) noexcept : storage(ctx.storage), batch(std::move(ctx.batch)), snapshot_(ctx.snapshot_) {
+    ctx.storage = nullptr;
+    ctx.snapshot_ = nullptr;
+  }
+
+  // GetSnapshot will create a snapshot first if it doesn't exist,
+  // and it's not a thread-safe operation.
+  const rocksdb::Snapshot *GetSnapshot() {
+    if (snapshot_ == nullptr) {
+      // Should not acquire a snapshot_ on a moved-from object.
+      CHECK(storage != nullptr);
+      snapshot_ = storage->GetDB()->GetSnapshot();  // NOLINT
+    }
+    return snapshot_;
+  }
+
+ private:
+  /// It is only used by NonTransactionContext
+  explicit Context(engine::Storage *storage, bool txn_mode) : storage(storage), txn_context_enabled(txn_mode) {}
+
+  /// If is_txn_mode is true, snapshot should be specified instead of nullptr when used,
+  /// and should be consistent with snapshot in ReadOptions to avoid ambiguity.
+  /// Normally it will be fixed to the latest Snapshot when the Context is constructed.
+  /// If is_txn_mode is false, the snapshot is nullptr.
+  const rocksdb::Snapshot *snapshot_ = nullptr;
 };
 
 }  // namespace engine

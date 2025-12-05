@@ -23,6 +23,7 @@
 #include <variant>
 
 #include "parse_util.h"
+#include "search/hnsw_indexer.h"
 #include "search/ir.h"
 #include "search/plan_executor.h"
 #include "search/search_encoding.h"
@@ -44,6 +45,9 @@ struct QueryExprEvaluator {
     if (auto v = dynamic_cast<NotExpr *>(e)) {
       return Visit(v);
     }
+    if (auto v = dynamic_cast<VectorRangeExpr *>(e)) {
+      return Visit(v);
+    }
     if (auto v = dynamic_cast<NumericCompareExpr *>(e)) {
       return Visit(v);
     }
@@ -51,7 +55,7 @@ struct QueryExprEvaluator {
       return Visit(v);
     }
 
-    CHECK(false) << "unreachable";
+    unreachable();
   }
 
   StatusOr<bool> Visit(AndExpr *v) const {
@@ -73,18 +77,27 @@ struct QueryExprEvaluator {
   StatusOr<bool> Visit(NotExpr *v) const { return !GET_OR_RET(Transform(v->inner.get())); }
 
   StatusOr<bool> Visit(TagContainExpr *v) const {
-    auto val = GET_OR_RET(ctx->Retrieve(row, v->field->info));
-    auto meta = v->field->info->MetadataAs<redis::SearchTagFieldMetadata>();
+    auto val = GET_OR_RET(ctx->Retrieve(ctx->db_ctx, row, v->field->info));
+    if (val.IsNull()) return false;
 
-    auto split = util::Split(val, std::string(1, meta->separator));
-    return std::find(split.begin(), split.end(), v->tag->val) != split.end();
+    CHECK(val.Is<kqir::StringArray>());
+    auto tags = val.Get<kqir::StringArray>();
+
+    auto meta = v->field->info->MetadataAs<redis::TagFieldMetadata>();
+    if (meta->case_sensitive) {
+      return std::find(tags.begin(), tags.end(), v->tag->val) != tags.end();
+    } else {
+      return std::find_if(tags.begin(), tags.end(),
+                          [v](const auto &tag) { return util::EqualICase(tag, v->tag->val); }) != tags.end();
+    }
   }
 
   StatusOr<bool> Visit(NumericCompareExpr *v) const {
-    auto l_str = GET_OR_RET(ctx->Retrieve(row, v->field->info));
+    auto l_val = GET_OR_RET(ctx->Retrieve(ctx->db_ctx, row, v->field->info));
+    if (l_val.IsNull()) return false;
 
-    // TODO: reconsider how to handle failure case here
-    auto l = GET_OR_RET(ParseFloat(l_str));
+    CHECK(l_val.Is<kqir::Numeric>());
+    auto l = l_val.Get<kqir::Numeric>();
     auto r = v->num->val;
 
     switch (v->op) {
@@ -101,9 +114,27 @@ struct QueryExprEvaluator {
       case NumericCompareExpr::GET:
         return l >= r;
       default:
-        CHECK(false) << "unreachable";
-        __builtin_unreachable();
+        unreachable();
     }
+  }
+
+  StatusOr<bool> Visit(VectorRangeExpr *v) const {
+    auto val = GET_OR_RET(ctx->Retrieve(ctx->db_ctx, row, v->field->info));
+    if (val.IsNull()) return false;
+
+    CHECK(val.Is<kqir::NumericArray>());
+    auto l_values = val.Get<kqir::NumericArray>();
+    auto r_values = v->vector->values;
+    auto meta = v->field->info->MetadataAs<redis::HnswVectorFieldMetadata>();
+
+    redis::VectorItem left, right;
+    GET_OR_RET(redis::VectorItem::Create({}, l_values, meta, &left));
+    GET_OR_RET(redis::VectorItem::Create({}, r_values, meta, &right));
+
+    auto dist = GET_OR_RET(redis::ComputeSimilarity(left, right));
+    auto effective_range = v->range->val * (1 + meta->epsilon);
+
+    return (dist >= -abs(effective_range) && dist <= abs(effective_range));
   }
 };
 

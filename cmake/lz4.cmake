@@ -20,19 +20,20 @@ include_guard()
 include(cmake/utils.cmake)
 
 FetchContent_DeclareGitHubWithMirror(lz4
-  lz4/lz4 v1.9.4
-  MD5=9c6b76f71921dd986468dcde7c095793
+  lz4/lz4 v1.10.0
+  MD5=0ef5a1dfd7fe28c246275c043531165d
 )
 
 FetchContent_GetProperties(lz4)
 if(NOT lz4_POPULATED)
   FetchContent_Populate(lz4)
 
-  if(CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
+  if((CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang") OR
+   (CMAKE_SYSTEM_NAME STREQUAL "Darwin" AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang"))
     set(APPLE_FLAG "CFLAGS=-isysroot ${CMAKE_OSX_SYSROOT}")
   endif()
   
-  add_custom_target(make_lz4 COMMAND ${MAKE_COMMAND} CC=${CMAKE_C_COMPILER} ${APPLE_FLAG} liblz4.a
+  add_custom_target(make_lz4 COMMAND ${MAKE_COMMAND} CC=${CMAKE_C_COMPILER} ${NINJA_MAKE_JOBS_FLAG} ${APPLE_FLAG} liblz4.a
     WORKING_DIRECTORY ${lz4_SOURCE_DIR}/lib
     BYPRODUCTS ${lz4_SOURCE_DIR}/lib/liblz4.a
   )

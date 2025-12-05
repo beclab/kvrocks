@@ -35,8 +35,7 @@ void SyncMigrateContext::Resume(const Status &migrate_result) {
   migrate_result_ = migrate_result;
   auto s = conn_->Owner()->EnableWriteEvent(conn_->GetFD());
   if (!s.IsOK()) {
-    LOG(ERROR) << "[server] Failed to enable write event on the sync migrate connection " << conn_->GetFD() << ": "
-               << s.Msg();
+    error("[server] Failed to enable write event on the sync migrate connection {}: {}", conn_->GetFD(), s.Msg());
   }
 }
 
@@ -51,7 +50,7 @@ void SyncMigrateContext::OnEvent(bufferevent *bev, int16_t events) {
   conn_->OnEvent(bev, events);
 }
 
-void SyncMigrateContext::TimerCB(int, int16_t events) {
+void SyncMigrateContext::TimerCB(int, [[maybe_unused]] int16_t events) {
   auto &&slot_migrator = srv_->slot_migrator;
 
   conn_->Reply(conn_->NilString());
@@ -66,9 +65,9 @@ void SyncMigrateContext::TimerCB(int, int16_t events) {
 
 void SyncMigrateContext::OnWrite(bufferevent *bev) {
   if (migrate_result_) {
-    conn_->Reply(redis::SimpleString("OK"));
+    conn_->Reply(redis::RESP_OK);
   } else {
-    conn_->Reply(redis::Error("ERR " + migrate_result_.Msg()));
+    conn_->Reply(redis::Error(migrate_result_));
   }
 
   timer_.reset();

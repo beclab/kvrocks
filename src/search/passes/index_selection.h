@@ -51,6 +51,8 @@ struct IndexSelection : Visitor {
     intervals.clear();
   }
 
+  std::string_view Name() override { return "Index Selection"; }
+
   std::unique_ptr<Node> Visit(std::unique_ptr<Projection> node) override {
     IntervalAnalysis analysis(false);
     node = Node::MustAs<Projection>(analysis.Transform(std::move(node)));
@@ -72,10 +74,11 @@ struct IndexSelection : Visitor {
   bool HasGoodOrder() const { return order && order->field->info->HasIndex(); }
 
   std::unique_ptr<PlanOperator> GenerateScanFromOrder() const {
-    if (order->field->info->MetadataAs<redis::SearchNumericFieldMetadata>()) {
+    if (order->field->info->MetadataAs<redis::NumericFieldMetadata>()) {
       return std::make_unique<NumericFieldScan>(order->field->CloneAs<FieldRef>(), Interval::Full(), order->order);
     } else {
-      CHECK(false) << "current only numeric field is supported for ordering";
+      // current only numeric field is supported for ordering
+      unreachable();
     }
   }
 
@@ -112,6 +115,12 @@ struct IndexSelection : Visitor {
     if (auto v = dynamic_cast<OrExpr *>(node)) {
       return VisitExpr(v);
     }
+    if (auto v = dynamic_cast<VectorKnnExpr *>(node)) {
+      return VisitExpr(v);
+    }
+    if (auto v = dynamic_cast<VectorRangeExpr *>(node)) {
+      return VisitExpr(v);
+    }
     if (auto v = dynamic_cast<NumericCompareExpr *>(node)) {
       return VisitExpr(v);
     }
@@ -122,7 +131,7 @@ struct IndexSelection : Visitor {
       return VisitExpr(v);
     }
 
-    CHECK(false) << "unreachable";
+    unreachable();
   }
 
   std::unique_ptr<PlanOperator> MakeFullIndexFilter(QueryExpr *node) const {
@@ -137,6 +146,9 @@ struct IndexSelection : Visitor {
 
   std::unique_ptr<PlanOperator> VisitExpr(TagContainExpr *node) const {
     if (node->field->info->HasIndex()) {
+      if (!node->field->info->MetadataAs<redis::TagFieldMetadata>()->case_sensitive) {
+        return std::make_unique<TagFieldScan>(node->field->CloneAs<FieldRef>(), util::ToLower(node->tag->val));
+      }
       return std::make_unique<TagFieldScan>(node->field->CloneAs<FieldRef>(), node->tag->val);
     }
 
@@ -148,6 +160,23 @@ struct IndexSelection : Visitor {
     if (node->field->info->HasIndex() && node->op != NumericCompareExpr::NE) {
       IntervalSet is(node->op, node->num->val);
       return PlanFromInterval(is, node->field.get(), SortByClause::ASC);
+    }
+
+    return MakeFullIndexFilter(node);
+  }
+
+  std::unique_ptr<PlanOperator> VisitExpr(VectorRangeExpr *node) const {
+    if (node->field->info->HasIndex()) {
+      return std::make_unique<HnswVectorFieldRangeScan>(node->field->CloneAs<FieldRef>(), node->vector->values,
+                                                        node->range->val);
+    }
+
+    return MakeFullIndexFilter(node);
+  }
+
+  std::unique_ptr<PlanOperator> VisitExpr(VectorKnnExpr *node) const {
+    if (node->field->info->HasIndex()) {
+      return std::make_unique<HnswVectorFieldKnnScan>(node->field->CloneAs<FieldRef>(), node->vector->values, node->k);
     }
 
     return MakeFullIndexFilter(node);

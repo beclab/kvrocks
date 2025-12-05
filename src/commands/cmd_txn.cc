@@ -29,21 +29,22 @@ namespace redis {
 
 class CommandMulti : public Commander {
  public:
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute([[maybe_unused]] engine::Context &ctx, [[maybe_unused]] Server *srv, Connection *conn,
+                 std::string *output) override {
     if (conn->IsFlagEnabled(Connection::kMultiExec)) {
       return {Status::RedisExecErr, "MULTI calls can not be nested"};
     }
     conn->ResetMultiExec();
     // Client starts into MULTI-EXEC
     conn->EnableFlag(Connection::kMultiExec);
-    *output = redis::SimpleString("OK");
+    *output = redis::RESP_OK;
     return Status::OK();
   }
 };
 
 class CommandDiscard : public Commander {
  public:
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute([[maybe_unused]] engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     if (!conn->IsFlagEnabled(Connection::kMultiExec)) {
       return {Status::RedisExecErr, "DISCARD without MULTI"};
     }
@@ -51,7 +52,7 @@ class CommandDiscard : public Commander {
     auto reset_watch = MakeScopeExit([srv, conn] { srv->ResetWatchedKeys(conn); });
     conn->ResetMultiExec();
 
-    *output = redis::SimpleString("OK");
+    *output = redis::RESP_OK;
 
     return Status::OK();
   }
@@ -59,7 +60,7 @@ class CommandDiscard : public Commander {
 
 class CommandExec : public Commander {
  public:
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute([[maybe_unused]] engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     if (!conn->IsFlagEnabled(Connection::kMultiExec)) {
       return {Status::RedisExecErr, "EXEC without MULTI"};
     }
@@ -68,8 +69,7 @@ class CommandExec : public Commander {
     auto reset_multiexec = MakeScopeExit([conn] { conn->ResetMultiExec(); });
 
     if (conn->IsMultiError()) {
-      *output = redis::Error("EXECABORT Transaction discarded");
-      return Status::OK();
+      return {Status::RedisExecAbort, "Transaction discarded"};
     }
 
     if (srv->IsWatchedKeysModified(conn)) {
@@ -78,51 +78,60 @@ class CommandExec : public Commander {
     }
 
     auto storage = srv->storage;
-    // Reply multi length first
-    conn->Reply(redis::MultiLen(conn->GetMultiExecCommands()->size()));
     // Execute multi-exec commands
     conn->SetInExec();
     auto s = storage->BeginTxn();
     if (s.IsOK()) {
       conn->ExecuteCommands(conn->GetMultiExecCommands());
+      // In Redis, errors happening after EXEC instead are not handled in a special way:
+      // all the other commands will be executed even if some command fails during
+      // the transaction.
+      // So, if conn->IsMultiError(), the transaction should still be committed.
       s = storage->CommitTxn();
     }
-    return s;
+
+    conn->ResetMultiExec();
+    reset_multiexec.Disable();
+
+    if (s) {
+      conn->Reply(Array(conn->GetQueuedReplies()));
+    } else {
+      conn->Reply(Array(std::vector<std::string>(conn->GetQueuedReplies().size(), redis::Error(s))));
+    }
+
+    conn->ClearQueuedReplies();
+    return Status::OK();
   }
 };
 
 class CommandWatch : public Commander {
  public:
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
-    if (conn->IsFlagEnabled(Connection::kMultiExec)) {
-      return {Status::RedisExecErr, "WATCH inside MULTI is not allowed"};
-    }
-
+  Status Execute([[maybe_unused]] engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     // If a conn is already marked as watched_keys_modified, we can skip the watch.
     if (srv->IsWatchedKeysModified(conn)) {
-      *output = redis::SimpleString("OK");
+      *output = redis::RESP_OK;
       return Status::OK();
     }
 
     srv->WatchKey(conn, std::vector<std::string>(args_.begin() + 1, args_.end()));
-    *output = redis::SimpleString("OK");
+    *output = redis::RESP_OK;
     return Status::OK();
   }
 };
 
 class CommandUnwatch : public Commander {
  public:
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute([[maybe_unused]] engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     srv->ResetWatchedKeys(conn);
-    *output = redis::SimpleString("OK");
+    *output = redis::RESP_OK;
     return Status::OK();
   }
 };
 
-REDIS_REGISTER_COMMANDS(MakeCmdAttr<CommandMulti>("multi", 1, "multi", 0, 0, 0),
-                        MakeCmdAttr<CommandDiscard>("discard", 1, "multi", 0, 0, 0),
-                        MakeCmdAttr<CommandExec>("exec", 1, "exclusive multi", 0, 0, 0),
-                        MakeCmdAttr<CommandWatch>("watch", -2, "multi", 1, -1, 1),
-                        MakeCmdAttr<CommandUnwatch>("unwatch", 1, "multi", 0, 0, 0), )
+REDIS_REGISTER_COMMANDS(Txn, MakeCmdAttr<CommandMulti>("multi", 1, "bypass-multi", NO_KEY),
+                        MakeCmdAttr<CommandDiscard>("discard", 1, "bypass-multi", NO_KEY),
+                        MakeCmdAttr<CommandExec>("exec", 1, "exclusive bypass-multi slow", NO_KEY),
+                        MakeCmdAttr<CommandWatch>("watch", -2, "no-multi", 1, -1, 1),
+                        MakeCmdAttr<CommandUnwatch>("unwatch", 1, "no-multi", NO_KEY), )
 
 }  // namespace redis

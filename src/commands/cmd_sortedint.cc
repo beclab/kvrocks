@@ -39,10 +39,11 @@ class CommandSortedintAdd : public Commander {
     return Commander::Parse(args);
   }
 
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     redis::Sortedint sortedint_db(srv->storage, conn->GetNamespace());
     uint64_t ret = 0;
-    auto s = sortedint_db.Add(args_[1], ids_, &ret);
+
+    auto s = sortedint_db.Add(ctx, args_[1], ids_, &ret);
     if (!s.ok()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -69,10 +70,11 @@ class CommandSortedintRem : public Commander {
     return Commander::Parse(args);
   }
 
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     redis::Sortedint sortedint_db(srv->storage, conn->GetNamespace());
     uint64_t ret = 0;
-    auto s = sortedint_db.Remove(args_[1], ids_, &ret);
+
+    auto s = sortedint_db.Remove(ctx, args_[1], ids_, &ret);
     if (!s.ok()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -87,10 +89,11 @@ class CommandSortedintRem : public Commander {
 
 class CommandSortedintCard : public Commander {
  public:
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     redis::Sortedint sortedint_db(srv->storage, conn->GetNamespace());
     uint64_t ret = 0;
-    auto s = sortedint_db.Card(args_[1], &ret);
+
+    auto s = sortedint_db.Card(ctx, args_[1], &ret);
     if (!s.ok()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -102,7 +105,7 @@ class CommandSortedintCard : public Commander {
 
 class CommandSortedintExists : public Commander {
  public:
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     redis::Sortedint sortedint_db(srv->storage, conn->GetNamespace());
     std::vector<uint64_t> ids;
     for (size_t i = 2; i < args_.size(); i++) {
@@ -115,7 +118,8 @@ class CommandSortedintExists : public Commander {
     }
 
     std::vector<int> exists;
-    auto s = sortedint_db.MExist(args_[1], ids, &exists);
+
+    auto s = sortedint_db.MExist(ctx, args_[1], ids, &exists);
     if (!s.ok() && !s.IsNotFound()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -162,10 +166,11 @@ class CommandSortedintRange : public Commander {
     return Commander::Parse(args);
   }
 
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     redis::Sortedint sortedint_db(srv->storage, conn->GetNamespace());
     std::vector<uint64_t> ids;
-    auto s = sortedint_db.Range(args_[1], cursor_id_, offset_, limit_, reversed_, &ids);
+
+    auto s = sortedint_db.Range(ctx, args_[1], cursor_id_, offset_, limit_, reversed_, &ids);
     if (!s.ok()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -223,11 +228,12 @@ class CommandSortedintRangeByValue : public Commander {
     return Commander::Parse(args);
   }
 
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     std::vector<uint64_t> ids;
     int size = 0;
     redis::Sortedint sortedint_db(srv->storage, conn->GetNamespace());
-    auto s = sortedint_db.RangeByValue(args_[1], spec_, &ids, &size);
+
+    auto s = sortedint_db.RangeByValue(ctx, args_[1], spec_, &ids, &size);
     if (!s.ok()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -249,7 +255,7 @@ class CommandSortedintRevRangeByValue : public CommandSortedintRangeByValue {
   CommandSortedintRevRangeByValue() : CommandSortedintRangeByValue(true) {}
 };
 
-REDIS_REGISTER_COMMANDS(MakeCmdAttr<CommandSortedintAdd>("siadd", -3, "write", 1, 1, 1),
+REDIS_REGISTER_COMMANDS(SortedInt, MakeCmdAttr<CommandSortedintAdd>("siadd", -3, "write", 1, 1, 1),
                         MakeCmdAttr<CommandSortedintRem>("sirem", -3, "write no-dbsize-check", 1, 1, 1),
                         MakeCmdAttr<CommandSortedintCard>("sicard", 2, "read-only", 1, 1, 1),
                         MakeCmdAttr<CommandSortedintExists>("siexists", -3, "read-only", 1, 1, 1),

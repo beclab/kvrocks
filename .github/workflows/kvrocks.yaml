@@ -40,7 +40,7 @@ jobs:
       docs_only: ${{ steps.result.outputs.docs_only }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3.0.0
+      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36
         id: changes
         with:
           filters: .github/config/changes.yml
@@ -57,18 +57,21 @@ jobs:
       FORCE_COLOR: 1
     steps:
       - uses: actions/checkout@v4
-      - name: Install typos
-        run: curl -LsSf https://github.com/crate-ci/typos/releases/download/v1.18.2/typos-v1.18.2-x86_64-unknown-linux-musl.tar.gz | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
-      - name: Run typos check
-        run: typos --config .github/config/typos.toml
+      - name: Check typos
+        uses: crate-ci/typos@v1.37.1
+        with:
+          config: .github/config/typos.toml
 
   check-and-lint:
     name: Lint and check code
     needs: [precondition]
     if: ${{ needs.precondition.outputs.docs_only != 'true' }}
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - uses: apache/skywalking-eyes/header@v0.7.0
+        with:
+          config: .github/config/licenserc.yml
       - uses: actions/setup-go@v5
         with:
           go-version-file: 'tests/gocase/go.mod'
@@ -76,24 +79,20 @@ jobs:
       - name: Prepare Dependencies
         run: |
           sudo apt update
-          sudo apt install -y clang-format-14 clang-tidy-14
-      - uses: apache/skywalking-eyes/header@v0.6.0
-        with:
-          config: .github/config/licenserc.yml
+          sudo apt install -y clang-format-18 clang-tidy-18
       - name: Check with clang-format
         id: check-format
-        run: ./x.py check format --clang-format-path clang-format-14
+        run: ./x.py check format --clang-format-path clang-format-18
       - name: Check with clang-tidy
         run: |
           ./x.py build --skip-build
-          ./x.py check tidy -j $(nproc) --clang-tidy-path clang-tidy-14 --run-clang-tidy-path run-clang-tidy-14
+          ./x.py check tidy -j $(nproc) --clang-tidy-path clang-tidy-18 --run-clang-tidy-path run-clang-tidy-18
       - name: Lint with golangci-lint
         run: ./x.py check golangci-lint
-
       - name: Prepare format patch
         if: always() && steps.check-format.outcome != 'success'
         run: |
-          ./x.py format --clang-format-path clang-format-14
+          ./x.py format --clang-format-path clang-format-18
           git diff -p > clang-format.patch
           cat clang-format.patch
       - name: Upload format patch
@@ -110,50 +109,66 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: Darwin Clang
-            os: macos-11
-            compiler: auto
           - name: Darwin Clang arm64
             os: macos-14
             compiler: auto
-          - name: Darwin Clang without Jemalloc
-            os: macos-11
+          - name: Darwin Clang arm64 without Jemalloc
+            os: macos-14
             compiler: auto
             without_jemalloc: -DDISABLE_JEMALLOC=ON
-          - name: Darwin Clang with OpenSSL
-            os: macos-11
+          - name: Darwin Clang arm64 with OpenSSL
+            os: macos-14
             compiler: auto
             with_openssl: -DENABLE_OPENSSL=ON
-          - name: Darwin Clang without luaJIT
-            os: macos-11
+          - name: Darwin Clang arm64 without luaJIT
+            os: macos-14
             compiler: auto
             without_luajit: -DENABLE_LUAJIT=OFF
+          # FIXME: temporarily disable macos-13 build, refer to #2874
+          # - name: Darwin Clang
+          #   os: macos-13
+          #   compiler: auto
+          # - name: Darwin Clang without Jemalloc
+          #   os: macos-13
+          #   compiler: auto
+          #   without_jemalloc: -DDISABLE_JEMALLOC=ON
+          # - name: Darwin Clang with OpenSSL
+          #   os: macos-13
+          #   compiler: auto
+          #   with_openssl: -DENABLE_OPENSSL=ON
+          # - name: Darwin Clang without luaJIT
+          #   os: macos-13
+          #   compiler: auto
+          #   without_luajit: -DENABLE_LUAJIT=OFF
           - name: Ubuntu GCC
-            os: ubuntu-20.04
+            os: ubuntu-22.04
             compiler: gcc
           - name: SonarCloud with Coverage
             os: ubuntu-22.04
             compiler: gcc
             sonarcloud: -DCMAKE_CXX_FLAGS=--coverage
           - name: Ubuntu Clang
-            os: ubuntu-20.04
-            compiler: clang
-          - name: Ubuntu 22 GCC
-            os: ubuntu-22.04
-            compiler: gcc
-          - name: Ubuntu 22 Clang
             os: ubuntu-22.04
             compiler: clang
+          # FIXME: https://github.com/apache/kvrocks/issues/2411
+          # - name: Ubuntu 24 GCC
+          #   os: ubuntu-24.04
+          #   compiler: gcc
+          # - name: Ubuntu 24 Clang
+          #   os: ubuntu-24.04
+          #   compiler: clang
           - name: Ubuntu GCC ASan
-            os: ubuntu-20.04
+            os: ubuntu-22.04
             without_jemalloc: -DDISABLE_JEMALLOC=ON
             with_sanitizer: -DENABLE_ASAN=ON
             compiler: gcc
+            ignore_when_asan: -tags="ignore_when_asan"
           - name: Ubuntu Clang ASan
-            os: ubuntu-20.04
+            os: ubuntu-22.04
             with_sanitizer: -DENABLE_ASAN=ON
             without_jemalloc: -DDISABLE_JEMALLOC=ON
             compiler: clang
+            ignore_when_asan: -tags="ignore_when_asan"
           - name: Ubuntu GCC TSan
             os: ubuntu-22.04
             without_jemalloc: -DDISABLE_JEMALLOC=ON
@@ -161,22 +176,23 @@ jobs:
             compiler: gcc
             ignore_when_tsan: -tags="ignore_when_tsan"
           - name: Ubuntu Clang TSan
-            os: ubuntu-20.04
+            os: ubuntu-22.04
             with_sanitizer: -DENABLE_TSAN=ON
             without_jemalloc: -DDISABLE_JEMALLOC=ON
             compiler: clang
             ignore_when_tsan: -tags="ignore_when_tsan"
           - name: Ubuntu Clang UBSAN
-            os: ubuntu-20.04
+            os: ubuntu-22.04
             with_sanitizer: -DENABLE_UBSAN=ON
             without_jemalloc: -DDISABLE_JEMALLOC=ON
             compiler: clang
+            ignore_when_ubsan: -tags="ignore_when_ubsan"
           - name: Ubuntu GCC Ninja
-            os: ubuntu-20.04
+            os: ubuntu-22.04
             with_ninja: --ninja
             compiler: gcc
           - name: Ubuntu GCC with OpenSSL
-            os: ubuntu-20.04
+            os: ubuntu-22.04
             compiler: gcc
             with_openssl: -DENABLE_OPENSSL=ON
           - name: Ubuntu Clang with OpenSSL
@@ -184,42 +200,83 @@ jobs:
             compiler: clang
             with_openssl: -DENABLE_OPENSSL=ON
           - name: Ubuntu GCC without luaJIT
-            os: ubuntu-20.04
+            os: ubuntu-22.04
             without_luajit: -DENABLE_LUAJIT=OFF
             compiler: gcc
           - name: Ubuntu Clang without luaJIT
-            os: ubuntu-20.04
+            os: ubuntu-22.04
             without_luajit: -DENABLE_LUAJIT=OFF
             compiler: clang
           - name: Ubuntu GCC with old encoding
-            os: ubuntu-20.04
+            os: ubuntu-22.04
             compiler: gcc
             new_encoding: -DENABLE_NEW_ENCODING=FALSE
           - name: Ubuntu Clang with old encoding
             os: ubuntu-22.04
             compiler: clang
             new_encoding: -DENABLE_NEW_ENCODING=FALSE
-          - name: Ubuntu GCC with speedb enabled
-            os: ubuntu-20.04
+          - name: Ubuntu ARM GCC
+            os: ubuntu-24.04-arm
             compiler: gcc
-            with_speedb: -DENABLE_SPEEDB=ON
+            arm_linux: true
+          - name: Ubuntu ARM Clang
+            os: ubuntu-24.04-arm
+            compiler: clang
+            arm_linux: true
+          - name: Ubuntu RISC-V GCC without luaJIT (QEMU)
+            os: ubuntu-24.04
+            riscv_toolchain: true
+            toolchain_file: cmake/riscv64.cmake
+            riscv_toolchain_url: "https://github.com/riscv-collab/riscv-gnu-toolchain/releases/download/2025.07.03/riscv64-glibc-ubuntu-24.04-gcc-nightly-2025.07.03-nightly.tar.xz"
+            cmake_crosscompiling: -DCMAKE_CROSSCOMPILING=TRUE
+            cmake_system_name: -DCMAKE_SYSTEM_NAME=Linux
+            cmake_system_processor: -DCMAKE_SYSTEM_PROCESSOR=riscv64
+            without_luajit: -DENABLE_LUAJIT=OFF
 
     runs-on: ${{ matrix.os }}
     env:
       SONARCLOUD_OUTPUT_DIR: sonarcloud-data
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE20: true
+      RISCV_PATH: "/opt/riscv"
     steps:
       - name: Setup macOS
         if: ${{ startsWith(matrix.os, 'macos') }}
         run: |
-          brew install cmake gcc autoconf automake libtool openssl
+          brew install --quiet --formula gcc autoconf automake libtool openssl coreutils
           echo "NPROC=$(sysctl -n hw.ncpu)" >> $GITHUB_ENV
           echo "CMAKE_EXTRA_DEFS=-DOPENSSL_ROOT_DIR=/usr/local/opt/openssl" >> $GITHUB_ENV
+
+      - name: Setup cmake
+        if: ${{ startsWith(matrix.os, 'macos') }}
+        # Cmake 4.0 has the compatibility issue, just pin it to 3.31.
+        # See https://github.com/actions/runner-images/issues/11926.
+        run: |
+          pipx install --force cmake==3.31
+
       - name: Setup Linux
-        if: ${{ startsWith(matrix.os, 'ubuntu') }}
+        if: ${{ startsWith(matrix.os, 'ubuntu') || matrix.arm_linux }}
         run: |
           sudo apt update
           sudo apt install -y ninja-build
           echo "NPROC=$(nproc)" >> $GITHUB_ENV
+      - name: Setup Linux ARM64
+        if: ${{ matrix.arm_linux }}
+        run: |
+          sudo apt install -y git build-essential cmake libtool python3 python3-pip libssl-dev
+      - name: Setup RISC-V Toolchain
+        if: ${{ matrix.riscv_toolchain }}
+        run: |
+          sudo apt install -y wget build-essential cmake git python3 \
+            libgflags-dev libsnappy-dev zlib1g-dev liblz4-dev libzstd-dev \
+            qemu-user qemu-user-static
+          sudo mkdir -p $RISCV_PATH
+          wget "${{ matrix.riscv_toolchain_url }}" -O riscv-toolchain.tar.xz
+          sudo tar -xvf riscv-toolchain.tar.xz -C $RISCV_PATH --strip-components=1
+          sudo sed -i "s|libdir='/mnt/riscv/riscv64-unknown-linux-gnu/lib'|libdir='$RISCV_PATH/riscv64-unknown-linux-gnu/lib'|g" \
+            $RISCV_PATH/riscv64-unknown-linux-gnu/lib/libatomic.la
+          echo "PATH=$RISCV_PATH/bin:$PATH" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=/opt/riscv/lib:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+          echo "QEMU_LD_PREFIX=$RISCV_PATH/sysroot" >> $GITHUB_ENV
 
       - name: Cache redis
         id: cache-redis
@@ -248,6 +305,7 @@ jobs:
         with:
           fetch-depth: 0
       - uses: actions/setup-python@v5
+        if: ${{ !matrix.arm_linux }}
         with:
           python-version: 3.x
       - uses: actions/setup-go@v5
@@ -260,15 +318,15 @@ jobs:
         if: ${{ matrix.sonarcloud }}
 
       - name: Install sonar-scanner and build-wrapper
-        uses: SonarSource/sonarcloud-github-c-cpp@v2
+        uses: SonarSource/sonarcloud-github-c-cpp@v3
         if: ${{ matrix.sonarcloud }}
 
       - name: Build Kvrocks
-        if: ${{ !matrix.sonarcloud }}
+        if: ${{ !matrix.sonarcloud && !matrix.riscv_toolchain }}
         run: |
           ./x.py build -j$NPROC --unittest --compiler ${{ matrix.compiler }} ${{ matrix.without_jemalloc }} \
             ${{ matrix.without_luajit }} ${{ matrix.with_ninja }} ${{ matrix.with_sanitizer }} ${{ matrix.with_openssl }} \
-            ${{ matrix.new_encoding }} ${{ matrix.with_speedb }} ${{ env.CMAKE_EXTRA_DEFS }}
+            ${{ matrix.new_encoding }} ${{ env.CMAKE_EXTRA_DEFS }}
 
       - name: Build Kvrocks (SonarCloud)
         if: ${{ matrix.sonarcloud }}
@@ -276,6 +334,11 @@ jobs:
           build-wrapper-linux-x86-64 --out-dir ${{ env.SONARCLOUD_OUTPUT_DIR }} ./x.py build -j$NPROC --compiler ${{ matrix.compiler }}  --skip-build
           cp -r build _build
           build-wrapper-linux-x86-64 --out-dir ${{ env.SONARCLOUD_OUTPUT_DIR }} ./x.py build -j$NPROC --unittest --compiler ${{ matrix.compiler }} ${{ matrix.sonarcloud }}
+
+      - name: Build Kvrocks (RISC-V)
+        if: ${{ matrix.riscv_toolchain }}
+        run: |
+          ./x.py build -j$NPROC --unittest --toolchain ${{ matrix.toolchain_file }}
 
       - name: Setup Coredump
         if: ${{ startsWith(matrix.os, 'ubuntu') }}
@@ -299,17 +362,17 @@ jobs:
           GOCASE_RUN_ARGS=""
           if [[ -n "${{ matrix.with_openssl }}" ]] && [[ "${{ matrix.os }}" == ubuntu* ]]; then
             git clone https://github.com/jsha/minica
-            cd minica && git checkout 96a5c93723cf3d34b50b3e723a9f05cd3765bc67 && go build && cd ..
-            ./minica/minica --domains localhost
+            cd minica && git checkout v1.1.0 && go build && cd ..
+            ./minica/minica --ca-alg rsa --domains localhost
             cp localhost/cert.pem tests/gocase/tls/cert/server.crt
             cp localhost/key.pem tests/gocase/tls/cert/server.key
             cp minica.pem tests/gocase/tls/cert/ca.crt
             GOCASE_RUN_ARGS="-tlsEnable"
           fi
-          ./x.py test go build $GOCASE_RUN_ARGS ${{ matrix.ignore_when_tsan}}
+          ./x.py test go build -parallel 2 $GOCASE_RUN_ARGS ${{ matrix.ignore_when_tsan}} ${{ matrix.ignore_when_asan}} ${{ matrix.ignore_when_ubsan}}
 
       - name: Install redis-py
-        run: pip3 install redis==4.3.6
+        run: pip3 install redis==5.2.0
 
       - name: Run kvrocks2redis Test
         # Currently, when enabling Tsan/Asan or running in macOS 11/14, the value mismatch in destination redis server.
@@ -384,12 +447,15 @@ jobs:
     name: Check Docker image
     needs: [precondition, check-and-lint, check-typos]
     if: ${{ needs.precondition.outputs.docs_only != 'true' }}
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
     steps:
       - uses: actions/checkout@v4
       - name: Get core numbers
         run: echo "NPROC=$(nproc)" >> $GITHUB_ENV
-      - uses: docker/build-push-action@v5
+      - uses: docker/build-push-action@v6
         with:
           context: .
           build-args: MORE_BUILD_ARGS=-j${{ env.NPROC }}
@@ -419,31 +485,30 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: CentOS 7
-            image: centos:7
-            compiler: gcc
           - name: openSUSE Leap 15
             image: opensuse/leap:15
             compiler: gcc
           - name: ArchLinux
             image: archlinux:base
             compiler: gcc
+          - name: Rocky Linux 8
+            image: rockylinux:8
+            compiler: gcc
+          - name: Rocky Linux 9
+            image: rockylinux:9
+            compiler: gcc
+          - name: Debian 12
+            image: debian:12
+            compiler: gcc
+          - name: Alpine 3
+            image: alpine:3
+            compiler: gcc
+            disable_jemalloc: -DDISABLE_JEMALLOC=ON
 
     runs-on: ubuntu-22.04
     container:
       image: ${{ matrix.image }}
     steps:
-      - name: Setup CentOS
-        if: ${{ startsWith(matrix.image, 'centos') }}
-        run: |
-          yum install -y centos-release-scl-rh
-          yum install -y devtoolset-11 python3 python3-pip autoconf automake wget git gcc gcc-c++
-          echo "NPROC=$(nproc)" >> $GITHUB_ENV
-          mv /usr/bin/gcc /usr/bin/gcc-4.8.5
-          ln -s /opt/rh/devtoolset-11/root/bin/gcc /usr/bin/gcc
-          mv /usr/bin/g++ /usr/bin/g++-4.8.5
-          ln -s /opt/rh/devtoolset-11/root/bin/g++ /usr/bin/g++
-
       - name: Setup ArchLinux
         if: ${{ startsWith(matrix.image, 'archlinux') }}
         run: |
@@ -451,19 +516,62 @@ jobs:
           pacman -Sy --noconfirm autoconf automake python3 python-redis git wget which cmake make gcc
           echo "NPROC=$(nproc)" >> $GITHUB_ENV
 
+          # FIXME: Workaround for gcc 15 issue for rocksdb https://github.com/apache/kvrocks/issues/2927
+          echo "CXXFLAGS=$CXXFLAGS -include cstdint" >> $GITHUB_ENV
+
       - name: Setup openSUSE
         if: ${{ startsWith(matrix.image, 'opensuse') }}
         run: |
-          zypper install -y gcc11 gcc11-c++ make wget git autoconf automake python3 python3-pip curl tar gzip cmake go
+          zypper install -y gcc11 gcc11-c++ make wget git autoconf automake python3 python3-pip curl tar gzip cmake go which
           update-alternatives --install /usr/bin/cc cc /usr/bin/gcc-11 100
           update-alternatives --install /usr/bin/c++ c++ /usr/bin/g++-11 100
           update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-11 100
           update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-11 100
           echo "NPROC=$(nproc)" >> $GITHUB_ENV
 
+      - name: Setup Rocky Linux 8
+        if: ${{ startsWith(matrix.image, 'rockylinux:8') }}
+        run: |
+          dnf install -y epel-release
+          dnf config-manager --set-enabled powertools
+          dnf install -y git gcc-toolset-12 autoconf automake libtool python3 python3-pip openssl-devel which cmake
+          source /opt/rh/gcc-toolset-12/enable
+          update-alternatives --install /usr/bin/gcc gcc /opt/rh/gcc-toolset-12/root/usr/bin/gcc 100
+          update-alternatives --install /usr/bin/g++ g++ /opt/rh/gcc-toolset-12/root/usr/bin/g++ 100
+          update-alternatives --install /usr/bin/cc cc /opt/rh/gcc-toolset-12/root/usr/bin/gcc 100
+          update-alternatives --install /usr/bin/c++ c++ /opt/rh/gcc-toolset-12/root/usr/bin/g++ 100
+          echo "NPROC=$(nproc)" >> $GITHUB_ENV
+
+      - name: Setup Rocky Linux 9
+        if: ${{ startsWith(matrix.image, 'rockylinux:9') }}
+        run: |
+          dnf install -y epel-release
+          dnf config-manager --set-enabled crb
+          dnf install -y git gcc-toolset-12 autoconf automake libtool python3 python3-pip openssl-devel which cmake
+          source /opt/rh/gcc-toolset-12/enable
+          update-alternatives --install /usr/bin/gcc gcc /opt/rh/gcc-toolset-12/root/usr/bin/gcc 100
+          update-alternatives --install /usr/bin/g++ g++ /opt/rh/gcc-toolset-12/root/usr/bin/g++ 100
+          update-alternatives --install /usr/bin/cc cc /opt/rh/gcc-toolset-12/root/usr/bin/gcc 100
+          update-alternatives --install /usr/bin/c++ c++ /opt/rh/gcc-toolset-12/root/usr/bin/g++ 100
+          echo "NPROC=$(nproc)" >> $GITHUB_ENV
+
+      - name: Setup Debian 12
+        if: ${{ startsWith(matrix.image, 'debian') }}
+        run: |
+          apt update
+          apt install -y bash build-essential cmake curl git libssl-dev libtool python3 python3-pip wget
+          echo "NPROC=$(nproc)" >> $GITHUB_ENV
+
+      - name: Setup Alpine
+        if: ${{ startsWith(matrix.image, 'alpine') }}
+        run: |
+          apk update
+          apk add bash cmake curl git python3 wget make gcc g++ autoconf linux-headers py3-pip py3-redis
+          echo "NPROC=$(nproc)" >> $GITHUB_ENV
+
       - name: Cache redis
         id: cache-redis
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: |
             ~/local/bin/redis-cli
@@ -471,7 +579,7 @@ jobs:
 
       - name: Cache redis server
         id: cache-redis-server
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: |
             ~/local/bin/redis-server
@@ -479,6 +587,7 @@ jobs:
 
       - name: Install redis
         if: ${{ steps.cache-redis.outputs.cache-hit != 'true' || steps.cache-redis-server.outputs.cache-hit != 'true' }}
+        shell: bash
         run: |
           curl -O https://download.redis.io/releases/redis-6.2.14.tar.gz
           tar -xzvf redis-6.2.14.tar.gz
@@ -486,15 +595,8 @@ jobs:
           pushd redis-6.2.14 && USE_JEMALLOC=no make -j$NPROC redis-cli && mv src/redis-cli $HOME/local/bin/ && popd
           pushd redis-6.2.14 && USE_JEMALLOC=no make -j$NPROC redis-server && mv src/redis-server $HOME/local/bin/ && popd
 
-      - name: Install cmake
-        if: ${{ startsWith(matrix.image, 'centos') }}
-        run: |
-          VERSION=3.26.4
-          wget https://github.com/Kitware/CMake/releases/download/v$VERSION/cmake-$VERSION-linux-x86_64.sh
-          bash cmake-$VERSION-linux-x86_64.sh --skip-license --prefix=/usr
-
-      - uses: actions/checkout@v3 #v4 use Node 20 and not working at CentOS 7
-      - uses: actions/setup-go@v4 #v5 use Node 20 too
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         if: ${{ !startsWith(matrix.image, 'opensuse') }}
         with:
           go-version-file: 'tests/gocase/go.mod'
@@ -502,7 +604,7 @@ jobs:
 
       - name: Build Kvrocks
         run: |
-          ./x.py build -j$NPROC --unittest --compiler ${{ matrix.compiler }}
+          ./x.py build -j$NPROC --unittest --compiler ${{ matrix.compiler }} ${{ matrix.disable_jemalloc }}
 
       - name: Run Unit Test
         run: |
@@ -512,13 +614,20 @@ jobs:
         run: |
           export PATH=$PATH:$HOME/local/bin/
           GOCASE_RUN_ARGS=""
-          ./x.py test go build $GOCASE_RUN_ARGS
+          ./x.py test go build -parallel 2 $GOCASE_RUN_ARGS
 
-      - name: Install redis-py
-        if: ${{ !startsWith(matrix.image, 'archlinux') }}  # already installed
+      - name: Install redis-py for openSUSE and Rocky
+        if: ${{ !startsWith(matrix.image, 'archlinux') && !startsWith(matrix.image, 'debian') && !startsWith(matrix.image, 'alpine') }}
         run: pip3 install redis==4.3.6
 
+      - name: Install redis-py for Debian
+        if: ${{ startsWith(matrix.image, 'debian') }}
+        run: apt install -y python3-redis
+
       - name: Run kvrocks2redis Test
+        # FIXME: https://github.com/apache/kvrocks/issues/2574
+        if: ${{ !startsWith(matrix.image, 'archlinux') }}
+        shell: bash
         run: |
           $HOME/local/bin/redis-server --daemonize yes
           mkdir -p kvrocks2redis-ci-data

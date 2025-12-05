@@ -21,8 +21,11 @@ package namespace
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/apache/kvrocks/tests/gocase/util"
 	"github.com/redis/go-redis/v9"
@@ -64,6 +67,43 @@ func TestNamespace(t *testing.T) {
 			require.NoError(t, r.Err())
 			require.Equal(t, token, r.Val())
 		}
+		for ns := range nsTokens {
+			r := rdb.Do(ctx, "NAMESPACE", "DEL", ns)
+			require.NoError(t, r.Err())
+			require.Equal(t, "OK", r.Val())
+		}
+	})
+
+	t.Run("Update token", func(t *testing.T) {
+		nsTokens := map[string]string{
+			"ns1": "token1",
+			"ns2": "token2",
+		}
+		for ns, token := range nsTokens {
+			r := rdb.Do(ctx, "NAMESPACE", "ADD", ns, token)
+			require.NoError(t, r.Err())
+			require.Equal(t, "OK", r.Val())
+		}
+		for ns, token := range nsTokens {
+			r := rdb.Do(ctx, "NAMESPACE", "GET", ns)
+			require.NoError(t, r.Err())
+			require.Equal(t, token, r.Val())
+		}
+		// Cannot update to an existing token occupied by another namespace
+		r := rdb.Do(ctx, "NAMESPACE", "SET", "ns1", "token2")
+		util.ErrorRegexp(t, r.Err(), ".*ERR the token already exists.*")
+		// It is ok to update to the same token
+		r = rdb.Do(ctx, "NAMESPACE", "SET", "ns1", "token1")
+		require.NoError(t, r.Err())
+		require.Equal(t, "OK", r.Val())
+		// Update to a different token
+		r = rdb.Do(ctx, "NAMESPACE", "SET", "ns1", "newtoken1")
+		require.NoError(t, r.Err())
+		require.Equal(t, "OK", r.Val())
+		r = rdb.Do(ctx, "NAMESPACE", "GET", "ns1")
+		require.NoError(t, r.Err())
+		require.Equal(t, "newtoken1", r.Val())
+
 		for ns := range nsTokens {
 			r := rdb.Do(ctx, "NAMESPACE", "DEL", ns)
 			require.NoError(t, r.Err())
@@ -181,7 +221,7 @@ func TestNamespaceReplicate(t *testing.T) {
 			require.NoError(t, r.Err())
 			require.Equal(t, "OK", r.Val())
 		}
-		util.WaitForOffsetSync(t, slaveRdb, masterRdb)
+		util.WaitForOffsetSync(t, slaveRdb, masterRdb, 5*time.Second)
 
 		// Can read namespaces on master
 		for ns, token := range nsTokens {
@@ -211,7 +251,7 @@ func TestNamespaceReplicate(t *testing.T) {
 			require.NoError(t, r.Err())
 			require.Equal(t, "OK", r.Val())
 		}
-		util.WaitForOffsetSync(t, slaveRdb, masterRdb)
+		util.WaitForOffsetSync(t, slaveRdb, masterRdb, 5*time.Second)
 
 		for ns, token := range nsTokens {
 			r := slaveRdb.Do(ctx, "NAMESPACE", "GET", ns)
@@ -224,7 +264,7 @@ func TestNamespaceReplicate(t *testing.T) {
 			require.NoError(t, r.Err())
 			require.Equal(t, "OK", r.Val())
 		}
-		util.WaitForOffsetSync(t, slaveRdb, masterRdb)
+		util.WaitForOffsetSync(t, slaveRdb, masterRdb, 5*time.Second)
 
 		for ns := range nsTokens {
 			r := slaveRdb.Do(ctx, "NAMESPACE", "GET", ns)
@@ -238,8 +278,55 @@ func TestNamespaceReplicate(t *testing.T) {
 	})
 
 	t.Run("Turn off namespace replication is not allowed", func(t *testing.T) {
+		r := masterRdb.Do(ctx, "NAMESPACE", "ADD", "test-ns", "ns-token")
+		require.NoError(t, r.Err())
+		require.Equal(t, "OK", r.Val())
 		util.ErrorRegexp(t, masterRdb.ConfigSet(ctx, "repl-namespace-enabled", "no").Err(), ".*cannot switch off repl_namespace_enabled when namespaces exist in db.*")
+
+		// it should be allowed after deleting all namespaces
+		r = masterRdb.Do(ctx, "NAMESPACE", "DEL", "test-ns")
+		require.NoError(t, r.Err())
+		require.Equal(t, "OK", r.Val())
+		require.NoError(t, masterRdb.ConfigSet(ctx, "repl-namespace-enabled", "no").Err())
 	})
+}
+
+func TestNamespaceReplicateWithFullSync(t *testing.T) {
+	config := map[string]string{
+		"rocksdb.write_buffer_size":       "4",
+		"rocksdb.target_file_size_base":   "16",
+		"rocksdb.max_write_buffer_number": "1",
+		"rocksdb.wal_ttl_seconds":         "0",
+		"rocksdb.wal_size_limit_mb":       "0",
+		"repl-namespace-enabled":          "yes",
+		"requirepass":                     "123",
+		"masterauth":                      "123",
+	}
+	master := util.StartServer(t, config)
+	defer master.Close()
+	masterClient := master.NewClientWithOption(&redis.Options{Password: "123"})
+	defer func() { require.NoError(t, masterClient.Close()) }()
+
+	slave := util.StartServer(t, config)
+	defer slave.Close()
+	slaveClient := slave.NewClientWithOption(&redis.Options{Password: "123"})
+	defer func() { require.NoError(t, slaveClient.Close()) }()
+
+	ctx := context.Background()
+	value := strings.Repeat("a", 128*1024)
+	for i := 0; i < 1024; i++ {
+		require.NoError(t, masterClient.Set(ctx, fmt.Sprintf("key%d", i), value, 0).Err())
+	}
+	require.NoError(t, masterClient.Do(ctx, "NAMESPACE", "ADD", "foo", "bar").Err())
+
+	util.SlaveOf(t, slaveClient, master)
+	util.WaitForOffsetSync(t, masterClient, slaveClient, 60*time.Second)
+
+	// Namespaces should be replicated after the full sync
+	require.Eventually(t, func() bool {
+		token, _ := slaveClient.Do(ctx, "NAMESPACE", "GET", "foo").Val().(string)
+		return token == "bar"
+	}, 5*time.Second, 100*time.Millisecond)
 }
 
 func TestNamespaceRewrite(t *testing.T) {

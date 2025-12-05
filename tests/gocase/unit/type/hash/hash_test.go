@@ -30,8 +30,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/apache/kvrocks/tests/gocase/util"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/apache/kvrocks/tests/gocase/util"
 )
 
 func getKeys(hash map[string]string) []string {
@@ -50,18 +52,30 @@ func getVals(hash map[string]string) []string {
 	return r
 }
 
-func TestHashWithRESP2(t *testing.T) {
-	testHash(t, "no")
+func TestHash(t *testing.T) {
+	configOptions := []util.ConfigOptions{
+		{
+			Name:       "txn-context-enabled",
+			Options:    []string{"yes", "no"},
+			ConfigType: util.YesNo,
+		},
+		{
+			Name:       "resp3-enabled",
+			Options:    []string{"yes", "no"},
+			ConfigType: util.YesNo,
+		},
+	}
+
+	configsMatrix, err := util.GenerateConfigsMatrix(configOptions)
+	require.NoError(t, err)
+
+	for _, configs := range configsMatrix {
+		testHash(t, configs)
+	}
 }
 
-func TestHashWithRESP3(t *testing.T) {
-	testHash(t, "yes")
-}
-
-var testHash = func(t *testing.T, enabledRESP3 string) {
-	srv := util.StartServer(t, map[string]string{
-		"resp3-enabled": enabledRESP3,
-	})
+var testHash = func(t *testing.T, configs util.KvrocksServerConfigs) {
+	srv := util.StartServer(t, configs)
 	defer srv.Close()
 	ctx := context.Background()
 	rdb := srv.NewClient()
@@ -104,6 +118,136 @@ var testHash = func(t *testing.T, enabledRESP3 string) {
 		require.Equal(t, int64(2), rdb.HSet(ctx, "hmsetmulti", "key1", "val1", "key2", "val2").Val())
 		require.Equal(t, int64(0), rdb.HSet(ctx, "hmsetmulti", "key1", "val1", "key2", "val2").Val())
 		require.Equal(t, int64(1), rdb.HSet(ctx, "hmsetmulti", "key1", "val1", "key3", "val3").Val())
+	})
+
+	t.Run("HSETEXPIRE wrong number of args", func(t *testing.T) {
+		pattern := ".*wrong number.*"
+		ttlStr := "3600"
+		testKey := "hsetKey"
+		r := rdb.Do(ctx, "hsetexpire", testKey, ttlStr)
+		util.ErrorRegexp(t, r.Err(), pattern)
+	})
+
+	t.Run("HSETEXPIRE incomplete pairs", func(t *testing.T) {
+		pattern := ".*field-value pairs must be complete.*"
+		ttlStr := "3600"
+		testKey := "hsetKey"
+		r := rdb.Do(ctx, "hsetexpire", testKey, ttlStr, "key1", "val1", "key2")
+		util.ErrorRegexp(t, r.Err(), pattern)
+	})
+
+	t.Run("HSET/HSETEXPIRE/HSETEXPIRE/persist update expire time", func(t *testing.T) {
+		ttlStr := "3600"
+		testKey := "hsetKeyUpdateTime"
+		// create an hash without expiration
+		r := rdb.Do(ctx, "hset", testKey, "key1", "val1", "key2", "val2")
+		require.NoError(t, r.Err())
+		noExp := rdb.ExpireTime(ctx, testKey)
+		// make sure there is not exp set on the key
+		assert.Equal(t, -1*time.Nanosecond, noExp.Val())
+		// validate we inserted the key/vals
+		values := rdb.HGetAll(ctx, testKey)
+		assert.Equal(t, 2, len(values.Val()))
+
+		// update the hash and add expiration
+		r = rdb.Do(ctx, "hsetexpire", testKey, ttlStr, "key3", "val3")
+		require.NoError(t, r.Err())
+		assert.Equal(t, "OK", r.Val())
+		firstExp := rdb.ExpireTime(ctx, testKey)
+		firstExpireTime := time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC).Add(firstExp.Val()).Unix()
+		// validate there is exp set on the key
+		assert.NotEqual(t, -1, firstExpireTime)
+		assert.Greater(t, firstExpireTime, time.Now().Unix())
+		// validate we updated the key/vals
+		values = rdb.HGetAll(ctx, testKey)
+		assert.Equal(t, 3, len(values.Val()))
+
+		// update the has and expiration
+		time.Sleep(1 * time.Second)
+		r = rdb.Do(ctx, "hsetexpire", testKey, ttlStr, "key4", "val4")
+		require.NoError(t, r.Err())
+		assert.Equal(t, "OK", r.Val())
+		// validate there is exp set on the key and it is new
+		secondExp := rdb.ExpireTime(ctx, testKey)
+		secondExpireTime := time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC).Add(secondExp.Val()).Unix()
+		assert.NotEqual(t, -1, secondExpireTime)
+		assert.Greater(t, secondExpireTime, time.Now().Unix())
+		assert.Greater(t, secondExpireTime, firstExpireTime)
+		// validate we updated the key/vals
+		values = rdb.HGetAll(ctx, testKey)
+		assert.Equal(t, 4, len(values.Val()))
+
+		//remove expiration on the key and verify
+		r = rdb.Do(ctx, "persist", testKey)
+		require.NoError(t, r.Err())
+		persist := rdb.ExpireTime(ctx, testKey)
+		assert.Equal(t, -1*time.Nanosecond, persist.Val())
+		// validate we still have the correct number of key/vals
+		values = rdb.HGetAll(ctx, testKey)
+		assert.Equal(t, 4, len(values.Val()))
+	})
+
+	t.Run("HSETEXPIRE/HLEN/EXPIRETIME - Small hash creation", func(t *testing.T) {
+		ttlStr := "3600"
+		testKey := "hsetexsmallhash"
+		hsetExSmallHash := make(map[string]string)
+		for i := 0; i < 8; i++ {
+			key := "__avoid_collisions__" + util.RandString(0, 8, util.Alpha)
+			val := "__avoid_collisions__" + util.RandString(0, 8, util.Alpha)
+			if _, ok := hsetExSmallHash[key]; ok {
+				i--
+			}
+			rdb.Do(ctx, "hsetexpire", testKey, ttlStr, key, val)
+			hsetExSmallHash[key] = val
+		}
+		require.Equal(t, int64(8), rdb.HLen(ctx, testKey).Val())
+		val := rdb.ExpireTime(ctx, testKey).Val()
+		expireTime := time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC).Add(val).Unix()
+		require.Greater(t, expireTime, time.Now().Unix())
+	})
+
+	t.Run("HSETEXPIRE/HLEN/EXPIRETIME - Big hash creation", func(t *testing.T) {
+		ttlStr := "3600"
+		testKey := "hsetexbighash"
+		hsetExBigHash := make(map[string]string)
+		for i := 0; i < 1024; i++ {
+			key := "__avoid_collisions__" + util.RandString(0, 8, util.Alpha)
+			val := "__avoid_collisions__" + util.RandString(0, 8, util.Alpha)
+			if _, ok := hsetExBigHash[key]; ok {
+				i--
+			}
+			rdb.Do(ctx, "hsetexpire", testKey, ttlStr, key, val)
+			hsetExBigHash[key] = val
+		}
+		require.Equal(t, int64(1024), rdb.HLen(ctx, testKey).Val())
+		val := rdb.ExpireTime(ctx, testKey).Val()
+		expireTime := time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC).Add(val).Unix()
+		require.Greater(t, expireTime, time.Now().Unix())
+	})
+
+	t.Run("HSETEXPIRE/HLEN/EXPIRETIME - Multi field-value pairs creation", func(t *testing.T) {
+		ttlStr := "3600"
+		testKey := "hsetexbighashPair"
+		hsetExBigHash := make(map[string]string)
+		cmd := []string{"hsetexpire", testKey, ttlStr}
+		for i := 0; i < 10; i++ {
+			key := "__avoid_collisions__" + util.RandString(0, 8, util.Alpha)
+			val := "__avoid_collisions__" + util.RandString(0, 8, util.Alpha)
+			if _, ok := hsetExBigHash[key]; ok {
+				i--
+			}
+			cmd = append(cmd, key, val)
+			hsetExBigHash[key] = val
+		}
+		args := make([]interface{}, len(cmd))
+		for i, v := range cmd {
+			args[i] = v
+		}
+		rdb.Do(ctx, args...)
+		require.Equal(t, int64(10), rdb.HLen(ctx, testKey).Val())
+		val := rdb.ExpireTime(ctx, testKey).Val()
+		expireTime := time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC).Add(val).Unix()
+		require.Greater(t, expireTime, time.Now().Unix())
 	})
 
 	t.Run("HGET against the small hash", func(t *testing.T) {
@@ -487,7 +631,7 @@ var testHash = func(t *testing.T, enabledRESP3 string) {
 	t.Run("HINCRBY fails against hash value with spaces (left)", func(t *testing.T) {
 		rdb.HSet(ctx, "samllhash", "str", " 11")
 		rdb.HSet(ctx, "bighash", "str", " 11")
-		pattern := "ERR.*not an integer.*"
+		pattern := "ERR.*not.*an integer.*"
 		util.ErrorRegexp(t, rdb.HIncrBy(ctx, "samllhash", "str", 1).Err(), pattern)
 		util.ErrorRegexp(t, rdb.HIncrBy(ctx, "bighash", "str", 1).Err(), pattern)
 	})
@@ -629,6 +773,23 @@ var testHash = func(t *testing.T, enabledRESP3 string) {
 		rdb.HSet(ctx, "hash", strings.Repeat("k", 336), "a")
 		rdb.HSet(ctx, "hash", strings.Repeat("k", 336), "b")
 		require.Equal(t, "b", rdb.HGet(ctx, "hash", strings.Repeat("k", 336)).Val())
+	})
+
+	t.Run("HSCAN without NOVALUES", func(t *testing.T) {
+		rdb.Del(ctx, "langhash")
+		rdb.HMSet(ctx, "langhash", []string{"lang1", "C++", "lang2", "JavaScript", "lang3", "Python", "lang4", "GoLanguage"})
+		res, _, _ := rdb.HScan(ctx, "langhash", 0, "lang1", 0).Result()
+		require.Equal(t, 2, len(res))
+		require.Equal(t, "lang1", res[0])
+		require.Equal(t, "C++", res[1])
+	})
+
+	t.Run("HSCAN with NOVALUES", func(t *testing.T) {
+		rdb.Del(ctx, "langhash")
+		rdb.HMSet(ctx, "langhash", []string{"lang1", "C++", "lang2", "JavaScript", "lang3", "Python", "lang4", "GoLanguage"})
+		res, _, _ := rdb.HScanNoValues(ctx, "langhash", 0, "lang1", 0).Result()
+		require.Equal(t, 1, len(res))
+		require.Equal(t, "lang1", res[0])
 	})
 
 	for _, size := range []int64{10, 512} {
@@ -858,6 +1019,47 @@ func TestHGetAllWithRESP3(t *testing.T) {
 func TestHashWithAsyncIOEnabled(t *testing.T) {
 	srv := util.StartServer(t, map[string]string{
 		"rocksdb.read_options.async_io": "yes",
+	})
+	defer srv.Close()
+
+	rdb := srv.NewClient()
+	defer func() { require.NoError(t, rdb.Close()) }()
+
+	ctx := context.Background()
+
+	t.Run("Test bug with large value after compaction", func(t *testing.T) {
+		testKey := "test-hash-1"
+		require.NoError(t, rdb.Del(ctx, testKey).Err())
+
+		src := rand.NewSource(time.Now().UnixNano())
+		dd := make([]byte, 5000)
+		for i := 1; i <= 50; i++ {
+			for j := range dd {
+				dd[j] = byte(src.Int63())
+			}
+			key := util.RandString(10, 20, util.Alpha)
+			require.NoError(t, rdb.HSet(ctx, testKey, key, string(dd)).Err())
+		}
+
+		require.EqualValues(t, 50, rdb.HLen(ctx, testKey).Val())
+		require.Len(t, rdb.HGetAll(ctx, testKey).Val(), 50)
+		require.Len(t, rdb.HKeys(ctx, testKey).Val(), 50)
+		require.Len(t, rdb.HVals(ctx, testKey).Val(), 50)
+
+		require.NoError(t, rdb.Do(ctx, "COMPACT").Err())
+
+		time.Sleep(5 * time.Second)
+
+		require.EqualValues(t, 50, rdb.HLen(ctx, testKey).Val())
+		require.Len(t, rdb.HGetAll(ctx, testKey).Val(), 50)
+		require.Len(t, rdb.HKeys(ctx, testKey).Val(), 50)
+		require.Len(t, rdb.HVals(ctx, testKey).Val(), 50)
+	})
+}
+
+func TestHashWithAsyncIODisabled(t *testing.T) {
+	srv := util.StartServer(t, map[string]string{
+		"rocksdb.read_options.async_io": "no",
 	})
 	defer srv.Close()
 

@@ -108,12 +108,6 @@ func TestSlotMigrateDestServerKilled(t *testing.T) {
 	clusterNodes += fmt.Sprintf("%s %s %d master - 10001-16383", id1, srv1.Host(), srv1.Port())
 	require.NoError(t, rdb0.Do(ctx, "clusterx", "SETNODES", clusterNodes, "1").Err())
 	require.NoError(t, rdb1.Do(ctx, "clusterx", "SETNODES", clusterNodes, "1").Err())
-
-	t.Run("MIGRATE - Slot is out of range", func(t *testing.T) {
-		require.ErrorContains(t, rdb0.Do(ctx, "clusterx", "migrate", -1, id1).Err(), "Slot is out of range")
-		require.ErrorContains(t, rdb0.Do(ctx, "clusterx", "migrate", 16384, id1).Err(), "Slot is out of range")
-	})
-
 	t.Run("MIGRATE - Cannot migrate slot to itself", func(t *testing.T) {
 		require.ErrorContains(t, rdb0.Do(ctx, "clusterx", "migrate", 1, id0).Err(), "Can't migrate slot to myself")
 	})
@@ -196,9 +190,13 @@ func TestSlotMigrateDestServerKilledAgain(t *testing.T) {
 	})
 
 	t.Run("MIGRATE - Fail to migrate slot because destination server is killed while migrating", func(t *testing.T) {
+		require.NoError(t, rdb0.ConfigSet(ctx, "migrate-batch-size-kb", "1").Err())
+		require.NoError(t, rdb0.ConfigSet(ctx, "migrate-batch-rate-limit-mb", "1").Err())
+
 		slot := 8
+		value := strings.Repeat("a", 512)
 		for i := 0; i < 20000; i++ {
-			require.NoError(t, rdb0.LPush(ctx, util.SlotTable[slot], i).Err())
+			require.NoError(t, rdb0.LPush(ctx, util.SlotTable[slot], value).Err())
 		}
 		require.Equal(t, "OK", rdb0.Do(ctx, "clusterx", "migrate", slot, id1).Val())
 		requireMigrateState(t, rdb0, slot, SlotMigrationStateStarted)
@@ -238,11 +236,15 @@ func TestSlotMigrateSourceServerFlushedOrKilled(t *testing.T) {
 
 	t.Run("MIGRATE - Fail to migrate slot because source server is flushed", func(t *testing.T) {
 		slot := 11
+		require.NoError(t, rdb0.ConfigSet(ctx, "migrate-speed", "32").Err())
+		// FLUSHDB only allowed in `redis-command` migrate type
+		require.NoError(t, rdb0.ConfigSet(ctx, "migrate-type", "redis-command").Err())
+		defer func() {
+			require.NoError(t, rdb0.ConfigSet(ctx, "migrate-type", "raw-key-value").Err())
+		}()
 		for i := 0; i < 20000; i++ {
 			require.NoError(t, rdb0.LPush(ctx, util.SlotTable[slot], i).Err())
 		}
-		require.NoError(t, rdb0.ConfigSet(ctx, "migrate-speed", "32").Err())
-		require.Equal(t, map[string]string{"migrate-speed": "32"}, rdb0.ConfigGet(ctx, "migrate-speed").Val())
 		require.Equal(t, "OK", rdb0.Do(ctx, "clusterx", "migrate", slot, id1).Val())
 		waitForMigrateState(t, rdb0, slot, SlotMigrationStateStarted)
 		require.NoError(t, rdb0.FlushDB(ctx).Err())
@@ -251,12 +253,14 @@ func TestSlotMigrateSourceServerFlushedOrKilled(t *testing.T) {
 	})
 
 	t.Run("MIGRATE - Fail to migrate slot because source server is killed while migrating", func(t *testing.T) {
+		require.NoError(t, rdb0.ConfigSet(ctx, "migrate-batch-size-kb", "1").Err())
+		require.NoError(t, rdb0.ConfigSet(ctx, "migrate-batch-rate-limit-mb", "1").Err())
+
 		slot := 20
+		value := strings.Repeat("a", 512)
 		for i := 0; i < 20000; i++ {
-			require.NoError(t, rdb0.LPush(ctx, util.SlotTable[slot], i).Err())
+			require.NoError(t, rdb0.LPush(ctx, util.SlotTable[slot], value).Err())
 		}
-		require.NoError(t, rdb0.ConfigSet(ctx, "migrate-speed", "32").Err())
-		require.Equal(t, map[string]string{"migrate-speed": "32"}, rdb0.ConfigGet(ctx, "migrate-speed").Val())
 		require.Equal(t, "OK", rdb0.Do(ctx, "clusterx", "migrate", slot, id1).Val())
 		require.Eventually(t, func() bool {
 			return slices.Contains(rdb1.Keys(ctx, "*").Val(), util.SlotTable[slot])
@@ -415,8 +419,9 @@ func TestSlotMigrateThreeNodes(t *testing.T) {
 
 	t.Run("MIGRATE - Fail to migrate slot because source server is changed to slave during migrating", func(t *testing.T) {
 		slot := 10
-		for i := 0; i < 10000; i++ {
-			require.NoError(t, rdb0.LPush(ctx, util.SlotTable[slot], i).Err())
+		value := strings.Repeat("a", 512)
+		for i := 0; i < 20000; i++ {
+			require.NoError(t, rdb0.LPush(ctx, util.SlotTable[slot], value).Err())
 		}
 		require.Equal(t, "OK", rdb0.Do(ctx, "clusterx", "migrate", slot, id2).Val())
 		requireMigrateState(t, rdb0, slot, SlotMigrationStateStarted)
@@ -456,6 +461,9 @@ func TestSlotMigrateSync(t *testing.T) {
 	require.NoError(t, rdb0.Do(ctx, "clusterx", "SETNODES", clusterNodes, "1").Err())
 	require.NoError(t, rdb1.Do(ctx, "clusterx", "SETNODES", clusterNodes, "1").Err())
 
+	require.NoError(t, rdb0.ConfigSet(ctx, "migrate-batch-size-kb", "1").Err())
+	require.NoError(t, rdb0.ConfigSet(ctx, "migrate-batch-rate-limit-mb", "1").Err())
+
 	slot := -1
 	t.Run("MIGRATE - Cannot migrate async with timeout", func(t *testing.T) {
 		slot++
@@ -482,17 +490,21 @@ func TestSlotMigrateSync(t *testing.T) {
 			err := rdb0.Do(ctx, "clusterx", "migrate", slot, id1, "sync", timeout).Err()
 			// go-redis will auto-retry if occurs timeout error, so it may return the already migrated slot error,
 			// so we just allow this error here to prevent the flaky test failure.
-			if err != nil && !strings.Contains(err.Error(), "ERR There is already a migrating slot") {
+			if err != nil && !strings.Contains(err.Error(), "ERR There is already a migrating job") {
 				require.NoError(t, err)
 			}
 		}
 	})
 
 	t.Run("MIGRATE - Migrate sync timeout", func(t *testing.T) {
+		require.NoError(t, rdb0.ConfigSet(ctx, "migrate-batch-size-kb", "1").Err())
+		require.NoError(t, rdb0.ConfigSet(ctx, "migrate-batch-rate-limit-mb", "1").Err())
+
 		slot++
-		cnt := 200000
+		cnt := 100000
+		value := strings.Repeat("a", 512)
 		for i := 0; i < cnt; i++ {
-			require.NoError(t, rdb0.LPush(ctx, util.SlotTable[slot], i).Err())
+			require.NoError(t, rdb0.LPush(ctx, util.SlotTable[slot], value).Err())
 		}
 
 		timeout := 1
@@ -531,7 +543,7 @@ func TestSlotMigrateDataType(t *testing.T) {
 		}
 		require.Equal(t, "OK", rdb0.Do(ctx, "clusterx", "migrate", slot, id1).Val())
 		otherSlot := 2
-		require.ErrorContains(t, rdb0.Do(ctx, "clusterx", "migrate", otherSlot, id1).Err(), "There is already a migrating slot")
+		require.ErrorContains(t, rdb0.Do(ctx, "clusterx", "migrate", otherSlot, id1).Err(), "There is already a migrating job")
 		waitForMigrateState(t, rdb0, slot, SlotMigrationStateSuccess)
 		require.EqualValues(t, cnt, rdb1.LLen(ctx, util.SlotTable[slot]).Val())
 	})
@@ -541,7 +553,7 @@ func TestSlotMigrateDataType(t *testing.T) {
 
 		testSlot += 1
 		keys := make(map[string]string, 0)
-		for _, typ := range []string{"string", "expired_string", "list", "hash", "set", "zset", "bitmap", "sortint", "stream"} {
+		for _, typ := range []string{"string", "expired_string", "list", "hash", "set", "zset", "bitmap", "sortint", "stream", "json"} {
 			keys[typ] = fmt.Sprintf("%s_{%s}", typ, util.SlotTable[testSlot])
 			require.NoError(t, rdb0.Del(ctx, keys[typ]).Err())
 		}
@@ -596,8 +608,9 @@ func TestSlotMigrateDataType(t *testing.T) {
 			}).Err())
 		}
 		require.NoError(t, rdb0.Expire(ctx, keys["stream"], 10*time.Second).Err())
+		require.NoError(t, rdb0.JSONSet(ctx, keys["json"], "$", `{"a": 1, "b": "hello"}`).Err())
 		// check source data existence
-		for _, typ := range []string{"string", "list", "hash", "set", "zset", "bitmap", "sortint", "stream"} {
+		for _, typ := range []string{"string", "list", "hash", "set", "zset", "bitmap", "sortint", "stream", "json"} {
 			require.EqualValues(t, 1, rdb0.Exists(ctx, keys[typ]).Val())
 		}
 		// get source data
@@ -659,6 +672,8 @@ func TestSlotMigrateDataType(t *testing.T) {
 		require.EqualValues(t, 19, streamInfo.EntriesAdded)
 		require.EqualValues(t, "0-0", streamInfo.MaxDeletedEntryID)
 		require.EqualValues(t, 19, streamInfo.Length)
+		// type json
+		require.Equal(t, `{"a":1,"b":"hello"}`, rdb1.JSONGet(ctx, keys["json"]).Val())
 		// topology is changed on source server
 		for _, typ := range []string{"string", "list", "hash", "set", "zset", "bitmap", "sortint", "stream"} {
 			require.ErrorContains(t, rdb0.Exists(ctx, keys[typ]).Err(), "MOVED")
@@ -753,7 +768,7 @@ func TestSlotMigrateDataType(t *testing.T) {
 		require.EqualValues(t, originRes.Length, migratedRes.Length)
 	}
 
-	migrateStreamWithDeletedEnties := func(t *testing.T, migrateType SlotMigrationType) {
+	migrateStreamWithDeletedEntries := func(t *testing.T, migrateType SlotMigrationType) {
 		require.NoError(t, rdb0.ConfigSet(ctx, "migrate-type", string(migrateType)).Err())
 
 		testSlot += 1
@@ -967,7 +982,7 @@ func TestSlotMigrateDataType(t *testing.T) {
 		})
 
 		t.Run(fmt.Sprintf("MIGRATE - Migrating stream with deleted entries using %s", testType), func(t *testing.T) {
-			migrateStreamWithDeletedEnties(t, testType)
+			migrateStreamWithDeletedEntries(t, testType)
 		})
 
 		t.Run(fmt.Sprintf("MIGRATE - Migrate incremental data via parsing and filtering data in WAL using %s", testType), func(t *testing.T) {
@@ -1168,24 +1183,205 @@ func waitForMigrateState(t testing.TB, client *redis.Client, slot int, state Slo
 	waitForMigrateStateInDuration(t, client, slot, state, 5*time.Second)
 }
 
+func waitForMigrateSlotRangeState(t testing.TB, client *redis.Client, slotRange string, state SlotMigrationState) {
+	waitForMigrateSlotRangeStateInDuration(t, client, slotRange, state, 5*time.Second)
+}
+
 func waitForMigrateStateInDuration(t testing.TB, client *redis.Client, slot int, state SlotMigrationState, d time.Duration) {
 	require.Eventually(t, func() bool {
 		i := client.ClusterInfo(context.Background()).Val()
-		return strings.Contains(i, fmt.Sprintf("migrating_slot: %d", slot)) &&
+		return strings.Contains(i, fmt.Sprintf("migrating_slot(s): %d", slot)) &&
+			strings.Contains(i, fmt.Sprintf("migrating_state: %s", state))
+	}, d, 100*time.Millisecond)
+}
+
+func waitForMigrateSlotRangeStateInDuration(t testing.TB, client *redis.Client, slotRange string, state SlotMigrationState, d time.Duration) {
+	slots := strings.Split(slotRange, "-")
+	if len(slots) == 2 && slots[0] == slots[1] {
+		slotRange = slots[0]
+	}
+	require.Eventually(t, func() bool {
+		i := client.ClusterInfo(context.Background()).Val()
+		return strings.Contains(i, fmt.Sprintf("migrating_slot(s): %s", slotRange)) &&
 			strings.Contains(i, fmt.Sprintf("migrating_state: %s", state))
 	}, d, 100*time.Millisecond)
 }
 
 func requireMigrateState(t testing.TB, client *redis.Client, slot int, state SlotMigrationState) {
 	i := client.ClusterInfo(context.Background()).Val()
-	require.Contains(t, i, fmt.Sprintf("migrating_slot: %d", slot))
+	require.Contains(t, i, fmt.Sprintf("migrating_slot(s): %d", slot))
+	require.Contains(t, i, fmt.Sprintf("migrating_state: %s", state))
+}
+
+func requireMigrateSlotRangeState(t testing.TB, client *redis.Client, slotRange string, state SlotMigrationState) {
+	i := client.ClusterInfo(context.Background()).Val()
+	require.Contains(t, i, fmt.Sprintf("migrating_slot(s): %s", slotRange))
 	require.Contains(t, i, fmt.Sprintf("migrating_state: %s", state))
 }
 
 func waitForImportState(t testing.TB, client *redis.Client, n int, state SlotImportState) {
 	require.Eventually(t, func() bool {
 		i := client.ClusterInfo(context.Background()).Val()
-		return strings.Contains(i, fmt.Sprintf("importing_slot: %d", n)) &&
+		return strings.Contains(i, fmt.Sprintf("importing_slot(s): %d", n)) &&
 			strings.Contains(i, fmt.Sprintf("import_state: %s", state))
 	}, 10*time.Second, 100*time.Millisecond)
+}
+
+func migrateSlotRangeAndSetSlot(t *testing.T, ctx context.Context, source *redis.Client, dest *redis.Client, destID string, slotRange string) {
+	require.Equal(t, "OK", source.Do(ctx, "clusterx", "migrate", slotRange, destID).Val())
+	waitForMigrateSlotRangeState(t, source, slotRange, SlotMigrationStateSuccess)
+	sourceVersion, _ := source.Do(ctx, "clusterx", "version").Int()
+	destVersion, _ := dest.Do(ctx, "clusterx", "version").Int()
+	require.NoError(t, source.Do(ctx, "clusterx", "setslot", slotRange, "node", destID, sourceVersion+1).Err())
+	require.NoError(t, dest.Do(ctx, "clusterx", "setslot", slotRange, "node", destID, destVersion+1).Err())
+}
+
+func TestSlotRangeMigrate(t *testing.T) {
+	ctx := context.Background()
+
+	srv0 := util.StartServer(t, map[string]string{"cluster-enabled": "yes"})
+	rdb0 := srv0.NewClient()
+	defer func() { require.NoError(t, rdb0.Close()) }()
+	defer func() { srv0.Close() }()
+	id0 := "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx00"
+	require.NoError(t, rdb0.Do(ctx, "clusterx", "SETNODEID", id0).Err())
+
+	srv1 := util.StartServer(t, map[string]string{"cluster-enabled": "yes"})
+	srv1Alive := true
+	defer func() {
+		if srv1Alive {
+			srv1.Close()
+		}
+	}()
+
+	rdb1 := srv1.NewClient()
+	defer func() { require.NoError(t, rdb1.Close()) }()
+	id1 := "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx01"
+	require.NoError(t, rdb1.Do(ctx, "clusterx", "SETNODEID", id1).Err())
+
+	clusterNodes := fmt.Sprintf("%s %s %d master - 0-10000\n", id0, srv0.Host(), srv0.Port())
+	clusterNodes += fmt.Sprintf("%s %s %d master - 10001-16383", id1, srv1.Host(), srv1.Port())
+	require.NoError(t, rdb0.Do(ctx, "clusterx", "SETNODES", clusterNodes, "1").Err())
+	require.NoError(t, rdb1.Do(ctx, "clusterx", "SETNODES", clusterNodes, "1").Err())
+
+	for slot := 0; slot < 500; slot++ {
+		for i := 0; i < 10; i++ {
+			require.NoError(t, rdb0.LPush(ctx, util.SlotTable[slot], i).Err())
+		}
+	}
+
+	t.Run("MIGRATE - Slot range migration basic cases", func(t *testing.T) {
+		migrateSlotRangeAndSetSlot(t, ctx, rdb0, rdb1, id1, "0-9")
+		nodes := rdb0.ClusterNodes(ctx).Val()
+		require.Contains(t, nodes, "10-10000", "0-9 10001-16383")
+	})
+
+	t.Run("MIGRATE - Special slot range cases", func(t *testing.T) {
+		for i := 0; i < 10; i++ {
+			require.NoError(t, rdb1.LPush(ctx, util.SlotTable[16383], i).Err())
+		}
+
+		migrateSlotRangeAndSetSlot(t, ctx, rdb0, rdb1, id1, "10")
+		time.Sleep(1 * time.Second)
+		migrateSlotRangeAndSetSlot(t, ctx, rdb0, rdb1, id1, "11-11")
+		time.Sleep(1 * time.Second)
+		migrateSlotRangeAndSetSlot(t, ctx, rdb1, rdb0, id0, "16383-16383")
+		time.Sleep(1 * time.Second)
+		nodes := rdb0.ClusterNodes(ctx).Val()
+		require.Contains(t, nodes, "12-10000 16383", "0-11 10001-16382")
+
+		errMsg := "Invalid slot range"
+		require.ErrorContains(t, rdb0.Do(ctx, "clusterx", "migrate", "-1", id1).Err(), errMsg)
+		require.ErrorContains(t, rdb0.Do(ctx, "clusterx", "migrate", "2-1", id1).Err(), errMsg)
+		require.ErrorContains(t, rdb0.Do(ctx, "clusterx", "migrate", "-1-3", id1).Err(), errMsg)
+		require.ErrorContains(t, rdb0.Do(ctx, "clusterx", "migrate", "-1--1", id1).Err(), errMsg)
+		require.ErrorContains(t, rdb0.Do(ctx, "clusterx", "migrate", "3--1", id1).Err(), errMsg)
+		require.ErrorContains(t, rdb0.Do(ctx, "clusterx", "migrate", "4-16384", id1).Err(), errMsg)
+		require.ErrorContains(t, rdb0.Do(ctx, "clusterx", "migrate", "16384-16384", id1).Err(), errMsg)
+
+		require.ErrorContains(t, rdb0.Do(ctx, "clusterx", "migrate", "16384", id1).Err(), "Invalid slot id: out of numeric range")
+	})
+
+	t.Run("MIGRATE - Repeat migration cases", func(t *testing.T) {
+		// non-overlapping
+		migrateSlotRangeAndSetSlot(t, ctx, rdb0, rdb1, id1, "104-106")
+		time.Sleep(1 * time.Second)
+		migrateSlotRangeAndSetSlot(t, ctx, rdb0, rdb1, id1, "107-108")
+		time.Sleep(1 * time.Second)
+		migrateSlotRangeAndSetSlot(t, ctx, rdb0, rdb1, id1, "102-103")
+		time.Sleep(1 * time.Second)
+		nodes := rdb0.ClusterNodes(ctx).Val()
+		require.Contains(t, nodes, "12-101 109-10000 16383", "0-11 102-108 10001-16382")
+
+		// overlap
+		errMsg := "Can't migrate slot which doesn't belong to me"
+		require.ErrorContains(t, rdb0.Do(ctx, "clusterx", "migrate", "100-102", id1).Err(), errMsg)
+		require.ErrorContains(t, rdb0.Do(ctx, "clusterx", "migrate", "100-104", id1).Err(), errMsg)
+		require.ErrorContains(t, rdb0.Do(ctx, "clusterx", "migrate", "108-109", id1).Err(), errMsg)
+		require.ErrorContains(t, rdb0.Do(ctx, "clusterx", "migrate", "106-109", id1).Err(), errMsg)
+
+		require.ErrorContains(t, rdb0.Do(ctx, "clusterx", "migrate", "102-108", id1).Err(), errMsg)
+		require.ErrorContains(t, rdb0.Do(ctx, "clusterx", "migrate", "101-109", id1).Err(), errMsg)
+		require.ErrorContains(t, rdb0.Do(ctx, "clusterx", "migrate", "105", id1).Err(), errMsg)
+		require.ErrorContains(t, rdb0.Do(ctx, "clusterx", "migrate", "105-105", id1).Err(), errMsg)
+		require.ErrorContains(t, rdb0.Do(ctx, "clusterx", "migrate", "104-106", id1).Err(), errMsg)
+	})
+
+	t.Run("MIGRATE - Repeat migration cases, but does not immediately update the topology via setslot", func(t *testing.T) {
+		// non-overlapping
+		require.Equal(t, "OK", rdb0.Do(ctx, "clusterx", "migrate", "114-116", id1).Val())
+		waitForMigrateSlotRangeState(t, rdb0, "114-116", SlotMigrationStateSuccess)
+		require.Equal(t, "OK", rdb0.Do(ctx, "clusterx", "migrate", "117-118", id1).Val())
+		waitForMigrateSlotRangeState(t, rdb0, "117-118", SlotMigrationStateSuccess)
+		require.Equal(t, "OK", rdb0.Do(ctx, "clusterx", "migrate", "112-113", id1).Val())
+		waitForMigrateSlotRangeState(t, rdb0, "112-113", SlotMigrationStateSuccess)
+		for slot := 112; slot <= 118; slot++ {
+			require.Contains(t, rdb0.LPush(ctx, util.SlotTable[slot], 10).Err(), "MOVED")
+		}
+
+		// overlap
+		errMsg := "Can't migrate slot which has been migrated"
+		require.ErrorContains(t, rdb0.Do(ctx, "clusterx", "migrate", "114-116", id1).Err(), errMsg)
+		require.ErrorContains(t, rdb0.Do(ctx, "clusterx", "migrate", "117-118", id1).Err(), errMsg)
+		require.ErrorContains(t, rdb0.Do(ctx, "clusterx", "migrate", "112", id1).Err(), errMsg)
+		require.ErrorContains(t, rdb0.Do(ctx, "clusterx", "migrate", "112-112", id1).Err(), errMsg)
+		require.ErrorContains(t, rdb0.Do(ctx, "clusterx", "migrate", "113", id1).Err(), errMsg)
+		require.ErrorContains(t, rdb0.Do(ctx, "clusterx", "migrate", "113-113", id1).Err(), errMsg)
+
+		require.ErrorContains(t, rdb0.Do(ctx, "clusterx", "migrate", "112-113", id1).Err(), errMsg)
+		require.ErrorContains(t, rdb0.Do(ctx, "clusterx", "migrate", "112-120", id1).Err(), errMsg)
+		require.ErrorContains(t, rdb0.Do(ctx, "clusterx", "migrate", "110-112", id1).Err(), errMsg)
+	})
+
+	t.Run("MIGRATE - Migrate back a proper subset range", func(t *testing.T) {
+		migrateSlotRangeAndSetSlot(t, ctx, rdb0, rdb1, id1, "3100-3400")
+		time.Sleep(1 * time.Second)
+		migrateSlotRangeAndSetSlot(t, ctx, rdb1, rdb0, id0, "3200-3300")
+		time.Sleep(1 * time.Second)
+
+		key := "AAA" // CLUSTER KEYSLOT AAA is `3205`, which is in the range of `3200-3500`
+		require.Equal(t, int64(3205), rdb0.ClusterKeySlot(ctx, key).Val())
+
+		require.NoError(t, rdb0.Set(ctx, key, "value", 0).Err())
+		require.Equal(t, "value", rdb0.Get(ctx, key).Val())
+	})
+
+	t.Run("MIGRATE - Failure cases", func(t *testing.T) {
+		require.NoError(t, rdb0.ConfigSet(ctx, "migrate-batch-size-kb", "1").Err())
+		require.NoError(t, rdb0.ConfigSet(ctx, "migrate-batch-rate-limit-mb", "1").Err())
+
+		largeSlot := 210
+		value := strings.Repeat("a", 512)
+		for i := 0; i < 20000; i++ {
+			require.NoError(t, rdb0.LPush(ctx, util.SlotTable[largeSlot], value).Err())
+		}
+		require.Equal(t, "OK", rdb0.Do(ctx, "clusterx", "migrate", "200-220", id1).Val())
+		requireMigrateSlotRangeState(t, rdb0, "200-220", SlotMigrationStateStarted)
+		srv1Alive = false
+		srv1.Close()
+		time.Sleep(time.Second)
+		// TODO: More precise migration failure slot range
+		waitForMigrateSlotRangeState(t, rdb0, "200-220", SlotMigrationStateFailed)
+	})
+
 }

@@ -31,6 +31,7 @@
 
 #include "config_type.h"
 #include "cron.h"
+#include "spdlog/common.h"
 #include "status.h"
 #include "storage/redis_metadata.h"
 
@@ -54,16 +55,23 @@ constexpr const size_t GiB = 1024L * MiB;
 constexpr const uint32_t kDefaultPort = 6666;
 
 constexpr const char *kDefaultNamespace = "__namespace";
+constexpr int KVROCKS_MAX_LSM_LEVEL = 7;
+
+constexpr const uint64_t kDefaultRocksdbTTL = UINT64_MAX - 1;
+constexpr const uint64_t kDefaultRocksdbPeriodicCompactionSeconds = UINT64_MAX - 1;
+
+const std::vector<ConfigEnum<spdlog::level::level_enum>> log_levels{
+    {"debug", spdlog::level::debug}, {"info", spdlog::level::info},      {"warning", spdlog::level::warn},
+    {"error", spdlog::level::err},   {"fatal", spdlog::level::critical},
+};
+
+const std::vector<ConfigEnum<spdlog::level::level_enum>> slowlog_dump_logfile_levels{
+    {"info", spdlog::level::info},
+    {"warning", spdlog::level::warn},
+    {"off", spdlog::level::off},
+};
 
 enum class BlockCacheType { kCacheTypeLRU = 0, kCacheTypeHCC };
-
-struct CompactionCheckerRange {
- public:
-  int start;
-  int stop;
-
-  bool Enabled() const { return start != -1 || stop != -1; }
-};
 
 struct CLIOptions {
   std::string conf_file;
@@ -78,6 +86,7 @@ struct Config {
   Config();
   ~Config() = default;
   uint32_t port = 0;
+  int socket_fd = -1;
 
   uint32_t tls_port = 0;
   std::string tls_cert_file;
@@ -97,28 +106,37 @@ struct Config {
 
   int workers = 0;
   int timeout = 0;
-  int log_level = 0;
+  int databases = 1;
+  spdlog::level::level_enum log_level = spdlog::level::info;
   int backlog = 511;
   int maxclients = 10000;
   int max_backup_to_keep = 1;
   int max_backup_keep_hours = 24;
   int slowlog_log_slower_than = 100000;
   int slowlog_max_len = 128;
+  spdlog::level::level_enum slowlog_dump_logfile_level = spdlog::level::off;
+  uint64_t proto_max_bulk_len = 512 * 1024 * 1024;
   bool daemonize = false;
   SupervisedMode supervised_mode = kSupervisedNone;
   bool slave_readonly = true;
   bool slave_serve_stale_data = true;
   bool slave_empty_db_before_fullsync = false;
   int slave_priority = 100;
+  int replication_connect_timeout_ms = 3100;
+  int replication_recv_timeout_ms = 3200;
+  int max_replication_delay_bytes = 16 * 1024;  // 16KB default
+  int max_replication_delay_updates = 16;       // 16 updates default
   int max_db_size = 0;
   int max_replication_mb = 0;
   int max_io_mb = 0;
+  bool enable_blob_cache = false;
   int max_bitmap_to_string_mb = 16;
   bool master_use_repl_port = false;
   bool purge_backup_on_fullsync = false;
-  bool auto_resize_block_and_sst = true;
   int fullsync_recv_file_delay = 0;
   bool use_rsid_psync = false;
+  bool replication_group_sync = false;
+  bool replication_no_slowdown = false;
   std::vector<std::string> binds;
   std::string dir;
   std::string db_dir;
@@ -138,7 +156,7 @@ struct Config {
   Cron compact_cron;
   Cron bgsave_cron;
   Cron dbsize_scan_cron;
-  CompactionCheckerRange compaction_checker_range{-1, -1};
+  Cron compaction_checker_cron;
   int64_t force_compact_file_age;
   int force_compact_file_min_deleted_percentage;
   bool repl_namespace_enabled = false;
@@ -175,6 +193,15 @@ struct Config {
   int json_max_nesting_depth = 1024;
   JsonStorageFormat json_storage_format = JsonStorageFormat::JSON;
 
+  // Enable transactional mode in engine::Context
+  bool txn_context_enabled = false;
+
+  bool skip_block_cache_deallocation_on_close = false;
+
+  bool lua_strict_key_accessing = false;
+
+  std::vector<double> histogram_bucket_boundaries;
+
   struct RocksDB {
     int block_size;
     bool cache_index_and_filter_blocks;
@@ -183,25 +210,28 @@ struct Config {
     int metadata_block_cache_size;
     int subkey_block_cache_size;
     bool share_metadata_and_subkey_block_cache;
-    int row_cache_size;
     int max_open_files;
     int write_buffer_size;
     int max_write_buffer_number;
+    int min_write_buffer_number_to_merge;
     int max_background_compactions;
     int max_background_flushes;
-    int max_sub_compactions;
+    int max_subcompactions;
     int stats_dump_period_sec;
     bool enable_pipelined_write;
     int64_t delayed_write_rate;
     int compaction_readahead_size;
     int target_file_size_base;
+    rocksdb::CompressionType wal_compression;
     int wal_ttl_seconds;
     int wal_size_limit_mb;
     int max_total_wal_size;
+    bool dump_malloc_stats;
     int level0_slowdown_writes_trigger;
     int level0_stop_writes_trigger;
     int level0_file_num_compaction_trigger;
     rocksdb::CompressionType compression;
+    int compression_start_level;
     int compression_level;
     bool disable_auto_compactions;
     bool enable_blob_files;
@@ -209,12 +239,18 @@ struct Config {
     int blob_file_size;
     bool enable_blob_garbage_collection;
     int blob_garbage_collection_age_cutoff;
-    int max_bytes_for_level_base;
+    uint64_t max_bytes_for_level_base;
     int max_bytes_for_level_multiplier;
     bool level_compaction_dynamic_level_bytes;
     int max_background_jobs;
     bool rate_limiter_auto_tuned;
     bool avoid_unnecessary_blocking_io = true;
+    bool partition_filters;
+    int64_t max_compaction_bytes;
+    int64_t sst_file_delete_rate_bytes_per_sec = 0;
+    uint64_t periodic_compaction_seconds = kDefaultRocksdbPeriodicCompactionSeconds;
+    uint64_t ttl = kDefaultRocksdbTTL;
+    std::string daily_offpeak_time_utc;
 
     struct WriteOptions {
       bool sync;
@@ -222,6 +258,7 @@ struct Config {
       bool no_slowdown;
       bool low_pri;
       bool memtable_insert_hint_per_batch;
+      int write_batch_max_bytes;
     } write_options;
 
     struct ReadOptions {
@@ -240,6 +277,7 @@ struct Config {
   void ClearMaster();
   bool IsSlave() const { return !master_host.empty(); }
   bool HasConfigFile() const { return !path_.empty(); }
+  std::string ConfigFilePath() const { return path_; }
 
  private:
   std::string path_;
@@ -249,9 +287,12 @@ struct Config {
   std::string bgsave_cron_str_;
   std::string dbsize_scan_cron_str_;
   std::string compaction_checker_range_str_;
+  std::string compaction_checker_cron_str_;
   std::string profiling_sample_commands_str_;
   std::map<std::string, std::unique_ptr<ConfigField>> fields_;
   std::vector<std::string> rename_command_;
+  std::string histogram_bucket_boundaries_str_;
+  std::set<std::string> deprecated_fields_;
 
   void initFieldValidator();
   void initFieldCallback();

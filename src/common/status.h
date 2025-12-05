@@ -21,15 +21,15 @@
 #pragma once
 
 #include <fmt/format.h>
-#include <glog/logging.h>
 
 #include <algorithm>
 #include <memory>
 #include <string>
-#include <tuple>
 #include <type_traits>
 #include <utility>
 
+#include "logging.h"
+#include "rocksdb/status.h"
 #include "type_util.h"
 
 class [[nodiscard]] Status {
@@ -50,9 +50,23 @@ class [[nodiscard]] Status {
     RedisInvalidCmd,
     RedisParseErr,
     RedisExecErr,
+    RedisErrorNoPrefix,
+    RedisNoProto,
+    RedisLoading,
+    RedisMasterDown,
+    RedisNoScript,
+    RedisNoAuth,
+    RedisWrongType,
+    RedisReadOnly,
+    RedisExecAbort,
+    RedisBusyGroup,
+    RedisNoGroup,
+    RedisMoved,
+    RedisCrossSlot,
+    RedisTryAgain,
+    RedisClusterDown,
 
     // Cluster
-    ClusterDown,
     ClusterInvalidInfo,
 
     // Blocking
@@ -61,6 +75,10 @@ class [[nodiscard]] Status {
     // Search
     NoPrefixMatched,
     TypeMismatched,
+
+    // IO
+    TryAgain,
+    EndOfFile,
   };
 
   Status() : impl_{nullptr} {}
@@ -163,7 +181,7 @@ struct StringInStatusOr<T, std::enable_if_t<sizeof(T) < sizeof(std::string)>> : 
   StringInStatusOr(StringInStatusOr<U>&& v) : BaseType(new std::string(*std::move(v))) {}  // NOLINT
   template <typename U, typename std::enable_if_t<!StringInStatusOr<U>::inplace, int> = 0>
   StringInStatusOr(StringInStatusOr<U>&& v)  // NOLINT
-      : BaseType((typename StringInStatusOr<U>::BaseType &&)(std::move(v))) {}
+      : BaseType((typename StringInStatusOr<U>::BaseType&&)(std::move(v))) {}
 
   StringInStatusOr(const StringInStatusOr& v) = delete;
 
@@ -356,10 +374,30 @@ struct [[nodiscard]] StatusOr {
   friend struct StatusOr;
 };
 
+template <typename T,
+          std::enable_if_t<IsStatusOr<RemoveCVRef<T>>::value || std::is_same_v<RemoveCVRef<T>, Status>, int> = 0>
+decltype(auto) StatusGetValue(T&& v) {
+  return std::forward<T>(v).GetValue();
+}
+
+template <typename T, std::enable_if_t<std::is_same_v<RemoveCVRef<T>, rocksdb::Status>, int> = 0>
+void StatusGetValue(T&&) {}
+
+template <typename T,
+          std::enable_if_t<IsStatusOr<RemoveCVRef<T>>::value || std::is_same_v<RemoveCVRef<T>, Status>, int> = 0>
+bool StatusIsOK(const T& v) {
+  return v.IsOK();
+}
+
+template <typename T, std::enable_if_t<std::is_same_v<RemoveCVRef<T>, rocksdb::Status>, int> = 0>
+bool StatusIsOK(const T& v) {
+  return v.ok();
+}
+
 // NOLINTNEXTLINE
-#define GET_OR_RET(...)                                         \
-  ({                                                            \
-    auto&& status = (__VA_ARGS__);                              \
-    if (!status) return std::forward<decltype(status)>(status); \
-    std::forward<decltype(status)>(status);                     \
-  }).GetValue()
+#define GET_OR_RET(...)                                                     \
+  StatusGetValue(({                                                         \
+    auto&& status = (__VA_ARGS__);                                          \
+    if (!StatusIsOK(status)) return std::forward<decltype(status)>(status); \
+    std::forward<decltype(status)>(status);                                 \
+  }))

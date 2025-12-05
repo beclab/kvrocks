@@ -33,7 +33,7 @@ class CommandPush : public Commander {
  public:
   CommandPush(bool create_if_missing, bool left) : left_(left), create_if_missing_(create_if_missing) {}
 
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     std::vector<Slice> elems;
     for (size_t i = 2; i < args_.size(); i++) {
       elems.emplace_back(args_[i]);
@@ -42,10 +42,11 @@ class CommandPush : public Commander {
     uint64_t ret = 0;
     rocksdb::Status s;
     redis::List list_db(srv->storage, conn->GetNamespace());
+
     if (create_if_missing_) {
-      s = list_db.Push(args_[1], elems, left_, &ret);
+      s = list_db.Push(ctx, args_[1], elems, left_, &ret);
     } else {
-      s = list_db.PushX(args_[1], elems, left_, &ret);
+      s = list_db.PushX(ctx, args_[1], elems, left_, &ret);
     }
     if (!s.ok()) {
       return {Status::RedisExecErr, s.ToString()};
@@ -109,11 +110,12 @@ class CommandPop : public Commander {
     return Status::OK();
   }
 
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     redis::List list_db(srv->storage, conn->GetNamespace());
+
     if (with_count_) {
       std::vector<std::string> elems;
-      auto s = list_db.PopMulti(args_[1], left_, count_, &elems);
+      auto s = list_db.PopMulti(ctx, args_[1], left_, count_, &elems);
       if (!s.ok() && !s.IsNotFound()) {
         return {Status::RedisExecErr, s.ToString()};
       }
@@ -125,7 +127,7 @@ class CommandPop : public Commander {
       }
     } else {
       std::string elem;
-      auto s = list_db.Pop(args_[1], left_, &elem);
+      auto s = list_db.Pop(ctx, args_[1], left_, &elem);
       if (!s.ok() && !s.IsNotFound()) {
         return {Status::RedisExecErr, s.ToString()};
       }
@@ -192,13 +194,14 @@ class CommandLMPop : public Commander {
     return Status::OK();
   }
 
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     redis::List list_db(srv->storage, conn->GetNamespace());
 
     std::vector<std::string> elems;
     std::string chosen_key;
+
     for (auto &key : keys_) {
-      auto s = list_db.PopMulti(key, left_, count_, &elems);
+      auto s = list_db.PopMulti(ctx, key, left_, count_, &elems);
       if (!s.ok() && !s.IsNotFound()) {
         return {Status::RedisExecErr, s.ToString()};
       }
@@ -259,11 +262,11 @@ class CommandBPop : public BlockingCommander {
     return Commander::Parse(args);
   }
 
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     srv_ = srv;
     InitConnection(conn);
 
-    auto s = TryPopFromList();
+    auto s = TryPopFromList(ctx);
     if (s.ok() || !s.IsNotFound()) {
       return Status::OK();  // error has already output in TryPopFromList
     }
@@ -283,14 +286,14 @@ class CommandBPop : public BlockingCommander {
     }
   }
 
-  rocksdb::Status TryPopFromList() {
+  rocksdb::Status TryPopFromList(engine::Context &ctx) {
     redis::List list_db(srv_->storage, conn_->GetNamespace());
     std::string elem;
     const std::string *last_key_ptr = nullptr;
     rocksdb::Status s;
     for (const auto &key : keys_) {
       last_key_ptr = &key;
-      s = list_db.Pop(key, left_, &elem);
+      s = list_db.Pop(ctx, key, left_, &elem);
       if (s.ok() || !s.IsNotFound()) {
         break;
       }
@@ -304,14 +307,25 @@ class CommandBPop : public BlockingCommander {
         conn_->Reply(conn_->MultiBulkString({*last_key_ptr, std::move(elem)}));
       }
     } else if (!s.IsNotFound()) {
-      conn_->Reply(redis::Error("ERR " + s.ToString()));
+      conn_->Reply(redis::Error({Status::NotOK, s.ToString()}));
     }
 
     return s;
   }
 
+  MultiLockGuard GetLocks() override {
+    std::vector<std::string> lock_keys;
+    lock_keys.reserve(keys_.size());
+    for (const auto &key : keys_) {
+      auto ns_key = ComposeNamespaceKey(conn_->GetNamespace(), key, srv_->storage->IsSlotIdEncoded());
+      lock_keys.emplace_back(std::move(ns_key));
+    }
+    return MultiLockGuard(srv_->storage->GetLockManager(), lock_keys);
+  }
+
   bool OnBlockingWrite() override {
-    auto s = TryPopFromList();
+    engine::Context ctx(srv_->storage);
+    auto s = TryPopFromList(ctx);
     return !s.IsNotFound();
   }
 
@@ -379,11 +393,11 @@ class CommandBLMPop : public BlockingCommander {
     return Status::OK();
   }
 
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     srv_ = srv;
     InitConnection(conn);
 
-    auto s = ExecuteUnblocked();
+    auto s = ExecuteUnblocked(ctx);
     if (s.ok() || !s.IsNotFound()) {
       return Status::OK();  // error has already been output
     }
@@ -391,13 +405,13 @@ class CommandBLMPop : public BlockingCommander {
     return StartBlocking(timeout_, output);
   }
 
-  rocksdb::Status ExecuteUnblocked() {
+  rocksdb::Status ExecuteUnblocked(engine::Context &ctx) {
     redis::List list_db(srv_->storage, conn_->GetNamespace());
     std::vector<std::string> elems;
     std::string chosen_key;
     rocksdb::Status s;
     for (const auto &key : keys_) {
-      s = list_db.PopMulti(key, left_, count_, &elems);
+      s = list_db.PopMulti(ctx, key, left_, count_, &elems);
       if (s.ok() && !elems.empty()) {
         chosen_key = key;
         break;
@@ -414,7 +428,7 @@ class CommandBLMPop : public BlockingCommander {
         conn_->Reply(redis::Array({redis::BulkString(chosen_key), std::move(elems_bulk)}));
       }
     } else if (!s.IsNotFound()) {
-      conn_->Reply(redis::Error("ERR " + s.ToString()));
+      conn_->Reply(redis::Error({Status::NotOK, s.ToString()}));
     }
 
     return s;
@@ -432,8 +446,19 @@ class CommandBLMPop : public BlockingCommander {
     }
   }
 
+  MultiLockGuard GetLocks() override {
+    std::vector<std::string> lock_keys;
+    lock_keys.reserve(keys_.size());
+    for (const auto &key : keys_) {
+      auto ns_key = ComposeNamespaceKey(conn_->GetNamespace(), key, srv_->storage->IsSlotIdEncoded());
+      lock_keys.emplace_back(std::move(ns_key));
+    }
+    return MultiLockGuard(srv_->storage->GetLockManager(), lock_keys);
+  }
+
   bool OnBlockingWrite() override {
-    auto s = ExecuteUnblocked();
+    engine::Context ctx(srv_->storage);
+    auto s = ExecuteUnblocked(ctx);
     return !s.IsNotFound();
   }
 
@@ -469,10 +494,11 @@ class CommandLRem : public Commander {
     return Commander::Parse(args);
   }
 
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     uint64_t ret = 0;
     redis::List list_db(srv->storage, conn->GetNamespace());
-    auto s = list_db.Rem(args_[1], count_, args_[3], &ret);
+
+    auto s = list_db.Rem(ctx, args_[1], count_, args_[3], &ret);
     if (!s.ok() && !s.IsNotFound()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -498,10 +524,11 @@ class CommandLInsert : public Commander {
     return Commander::Parse(args);
   }
 
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     int ret = 0;
     redis::List list_db(srv->storage, conn->GetNamespace());
-    auto s = list_db.Insert(args_[1], args_[3], args_[4], before_, &ret);
+
+    auto s = list_db.Insert(ctx, args_[1], args_[3], args_[4], before_, &ret);
     if (!s.ok() && !s.IsNotFound()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -528,10 +555,11 @@ class CommandLRange : public Commander {
     return Commander::Parse(args);
   }
 
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     redis::List list_db(srv->storage, conn->GetNamespace());
     std::vector<std::string> elems;
-    auto s = list_db.Range(args_[1], start_, stop_, &elems);
+
+    auto s = list_db.Range(ctx, args_[1], start_, stop_, &elems);
     if (!s.ok() && !s.IsNotFound()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -546,10 +574,11 @@ class CommandLRange : public Commander {
 
 class CommandLLen : public Commander {
  public:
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     redis::List list_db(srv->storage, conn->GetNamespace());
     uint64_t count = 0;
-    auto s = list_db.Size(args_[1], &count);
+
+    auto s = list_db.Size(ctx, args_[1], &count);
     if (!s.ok() && !s.IsNotFound()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -571,10 +600,11 @@ class CommandLIndex : public Commander {
     return Commander::Parse(args);
   }
 
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     redis::List list_db(srv->storage, conn->GetNamespace());
     std::string elem;
-    auto s = list_db.Index(args_[1], index_, &elem);
+
+    auto s = list_db.Index(ctx, args_[1], index_, &elem);
     if (!s.ok() && !s.IsNotFound()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -603,9 +633,10 @@ class CommandLSet : public Commander {
     return Commander::Parse(args);
   }
 
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     redis::List list_db(srv->storage, conn->GetNamespace());
-    auto s = list_db.Set(args_[1], index_, args_[3]);
+
+    auto s = list_db.Set(ctx, args_[1], index_, args_[3]);
     if (!s.ok() && !s.IsNotFound()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -614,7 +645,7 @@ class CommandLSet : public Commander {
       return {Status::RedisExecErr, errNoSuchKey};
     }
 
-    *output = redis::SimpleString("OK");
+    *output = redis::RESP_OK;
     return Status::OK();
   }
 
@@ -637,14 +668,15 @@ class CommandLTrim : public Commander {
     return Commander::Parse(args);
   }
 
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     redis::List list_db(srv->storage, conn->GetNamespace());
-    auto s = list_db.Trim(args_[1], start_, stop_);
+
+    auto s = list_db.Trim(ctx, args_[1], start_, stop_);
     if (!s.ok()) {
       return {Status::RedisExecErr, s.ToString()};
     }
 
-    *output = redis::SimpleString("OK");
+    *output = redis::RESP_OK;
     return Status::OK();
   }
 
@@ -655,10 +687,11 @@ class CommandLTrim : public Commander {
 
 class CommandRPopLPUSH : public Commander {
  public:
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     redis::List list_db(srv->storage, conn->GetNamespace());
     std::string elem;
-    auto s = list_db.LMove(args_[1], args_[2], /*src_left=*/false, /*dst_left=*/true, &elem);
+
+    auto s = list_db.LMove(ctx, args_[1], args_[2], /*src_left=*/false, /*dst_left=*/true, &elem);
     if (!s.ok() && !s.IsNotFound()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -670,7 +703,7 @@ class CommandRPopLPUSH : public Commander {
 
 class CommandLMove : public Commander {
  public:
-  Status Parse(const std::vector<std::string> &args) override {
+  Status Parse([[maybe_unused]] const std::vector<std::string> &args) override {
     auto arg_val = util::ToLower(args_[3]);
     if (arg_val != "left" && arg_val != "right") {
       return {Status::RedisParseErr, errInvalidSyntax};
@@ -686,10 +719,11 @@ class CommandLMove : public Commander {
     return Status::OK();
   }
 
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     redis::List list_db(srv->storage, conn->GetNamespace());
     std::string elem;
-    auto s = list_db.LMove(args_[1], args_[2], src_left_, dst_left_, &elem);
+
+    auto s = list_db.LMove(ctx, args_[1], args_[2], src_left_, dst_left_, &elem);
     if (!s.ok() && !s.IsNotFound()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -730,13 +764,14 @@ class CommandBLMove : public BlockingCommander {
     return Status::OK();
   }
 
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     srv_ = srv;
     InitConnection(conn);
 
     redis::List list_db(srv->storage, conn->GetNamespace());
     std::string elem;
-    auto s = list_db.LMove(args_[1], args_[2], src_left_, dst_left_, &elem);
+
+    auto s = list_db.LMove(ctx, args_[1], args_[2], src_left_, dst_left_, &elem);
     if (!s.ok() && !s.IsNotFound()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -752,12 +787,22 @@ class CommandBLMove : public BlockingCommander {
 
   void UnblockKeys() override { srv_->UnblockOnKey(args_[1], conn_); }
 
+  MultiLockGuard GetLocks() override {
+    std::vector<std::string> lock_keys{
+        ComposeNamespaceKey(conn_->GetNamespace(), args_[1], srv_->storage->IsSlotIdEncoded())};
+    if (args_[1] != args_[2]) {
+      lock_keys.emplace_back(ComposeNamespaceKey(conn_->GetNamespace(), args_[2], srv_->storage->IsSlotIdEncoded()));
+    }
+    return MultiLockGuard(srv_->storage->GetLockManager(), lock_keys);
+  }
+
   bool OnBlockingWrite() override {
     redis::List list_db(srv_->storage, conn_->GetNamespace());
     std::string elem;
-    auto s = list_db.LMove(args_[1], args_[2], src_left_, dst_left_, &elem);
+    engine::Context ctx(srv_->storage);
+    auto s = list_db.LMove(ctx, args_[1], args_[2], src_left_, dst_left_, &elem);
     if (!s.ok() && !s.IsNotFound()) {
-      conn_->Reply(redis::Error("ERR " + s.ToString()));
+      conn_->Reply(redis::Error({Status::NotOK, s.ToString()}));
       return true;
     }
 
@@ -815,10 +860,11 @@ class CommandLPos : public Commander {
     return Status::OK();
   }
 
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute(engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     redis::List list_db(srv->storage, conn->GetNamespace());
     std::vector<int64_t> indexes;
-    auto s = list_db.Pos(args_[1], args_[2], spec_, &indexes);
+
+    auto s = list_db.Pos(ctx, args_[1], args_[2], spec_, &indexes);
     if (!s.ok() && !s.IsNotFound()) {
       return {Status::RedisExecErr, s.ToString()};
     }
@@ -848,20 +894,20 @@ class CommandLPos : public Commander {
   PosSpec spec_;
 };
 
-REDIS_REGISTER_COMMANDS(MakeCmdAttr<CommandBLPop>("blpop", -3, "write no-script", 1, -2, 1),
-                        MakeCmdAttr<CommandBRPop>("brpop", -3, "write no-script", 1, -2, 1),
-                        MakeCmdAttr<CommandBLMPop>("blmpop", -5, "write no-script", CommandBLMPop::keyRangeGen),
+REDIS_REGISTER_COMMANDS(List, MakeCmdAttr<CommandBLPop>("blpop", -3, "write blocking", 1, -2, 1),
+                        MakeCmdAttr<CommandBRPop>("brpop", -3, "write blocking", 1, -2, 1),
+                        MakeCmdAttr<CommandBLMPop>("blmpop", -5, "write blocking", CommandBLMPop::keyRangeGen),
                         MakeCmdAttr<CommandLIndex>("lindex", 3, "read-only", 1, 1, 1),
-                        MakeCmdAttr<CommandLInsert>("linsert", 5, "write", 1, 1, 1),
+                        MakeCmdAttr<CommandLInsert>("linsert", 5, "write slow", 1, 1, 1),
                         MakeCmdAttr<CommandLLen>("llen", 2, "read-only", 1, 1, 1),
                         MakeCmdAttr<CommandLMove>("lmove", 5, "write", 1, 2, 1),
-                        MakeCmdAttr<CommandBLMove>("blmove", 6, "write", 1, 2, 1),
+                        MakeCmdAttr<CommandBLMove>("blmove", 6, "write blocking", 1, 2, 1),
                         MakeCmdAttr<CommandLPop>("lpop", -2, "write", 1, 1, 1),  //
                         MakeCmdAttr<CommandLPos>("lpos", -3, "read-only", 1, 1, 1),
                         MakeCmdAttr<CommandLPush>("lpush", -3, "write", 1, 1, 1),
                         MakeCmdAttr<CommandLPushX>("lpushx", -3, "write", 1, 1, 1),
                         MakeCmdAttr<CommandLRange>("lrange", 4, "read-only", 1, 1, 1),
-                        MakeCmdAttr<CommandLRem>("lrem", 4, "write no-dbsize-check", 1, 1, 1),
+                        MakeCmdAttr<CommandLRem>("lrem", 4, "write no-dbsize-check slow", 1, 1, 1),
                         MakeCmdAttr<CommandLSet>("lset", 4, "write", 1, 1, 1),
                         MakeCmdAttr<CommandLTrim>("ltrim", 4, "write no-dbsize-check", 1, 1, 1),
                         MakeCmdAttr<CommandLMPop>("lmpop", -4, "write", CommandLMPop::keyRangeGen),

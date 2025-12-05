@@ -31,9 +31,11 @@
 #include "search/passes/interval_analysis.h"
 #include "search/passes/lower_to_plan.h"
 #include "search/passes/push_down_not_expr.h"
+#include "search/passes/recorder.h"
 #include "search/passes/simplify_and_or_expr.h"
 #include "search/passes/simplify_boolean.h"
 #include "search/passes/sort_limit_fuse.h"
+#include "search/passes/sort_limit_to_knn.h"
 #include "type_util.h"
 
 namespace kqir {
@@ -60,6 +62,19 @@ struct PassManager {
     return result;
   }
 
+  static PassSequence FullRecord(PassSequence &&seq, std::vector<Recorder::Result> &results) {
+    PassSequence res_seq;
+    res_seq.push_back(std::make_unique<Recorder>("", results));
+
+    for (auto &p : seq) {
+      auto name = p->Name();
+      res_seq.push_back(std::move(p));
+      res_seq.push_back(std::make_unique<Recorder>(name, results));
+    }
+
+    return res_seq;
+  }
+
   template <typename... PassSeqs>
   static PassSequence Merge(PassSeqs &&...seqs) {
     static_assert(std::conjunction_v<std::negation<std::is_reference<PassSeqs>>...>);
@@ -73,12 +88,14 @@ struct PassManager {
   }
 
   static PassSequence ExprPasses() {
-    return Create(SimplifyAndOrExpr{}, PushDownNotExpr{}, SimplifyBoolean{}, SimplifyAndOrExpr{});
+    return Create(SimplifyAndOrExpr{}, PushDownNotExpr{}, SimplifyBoolean{}, SimplifyAndOrExpr{},
+                  SortByWithLimitToKnnExpr{}, SimplifyAndOrExpr{});
   }
   static PassSequence NumericPasses() { return Create(IntervalAnalysis{true}, SimplifyAndOrExpr{}, SimplifyBoolean{}); }
   static PassSequence PlanPasses() { return Create(LowerToPlan{}, IndexSelection{}, SortLimitFuse{}); }
 
   static PassSequence Default() { return Merge(ExprPasses(), NumericPasses(), PlanPasses()); }
+  static PassSequence Debug(std::vector<Recorder::Result> &recorded) { return FullRecord(Default(), recorded); }
 };
 
 }  // namespace kqir

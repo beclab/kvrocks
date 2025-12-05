@@ -24,8 +24,7 @@
 [![GitHub stars](https://img.shields.io/github/stars/apache/kvrocks)](https://github.com/apache/kvrocks/stargazers)
 
 ---
-
-* [Slack Channel](https://join.slack.com/t/kvrockscommunity/shared_invite/zt-p5928e3r-OUAK8SUgC8GOceGM6dAz6w)
+* [Chat on Zulip](https://kvrocks.zulipchat.com/)
 * [Mailing List](https://lists.apache.org/list.html?dev@kvrocks.apache.org) ([how to subscribe](https://www.apache.org/foundation/mailinglists.html#subscribing))
 
 **Apache Kvrocks** is a distributed key value NoSQL database that uses RocksDB as storage engine and is compatible with Redis protocol. Kvrocks intends to decrease the cost of memory and increase the capacity while compared to Redis. The design of replication and storage was inspired by [rocksplicator](https://github.com/pinterest/rocksplicator) and [blackwidow](https://github.com/Qihoo360/blackwidow).
@@ -81,8 +80,7 @@ It is as simple as:
 ```shell
 $ git clone https://github.com/apache/kvrocks.git
 $ cd kvrocks
-$ ./x.py build # `./x.py build -h` to check more options;
-               # especially, `./x.py build --ghproxy` will fetch dependencies via ghproxy.com.
+$ ./x.py build # `./x.py build -h` to check more options
 ```
 
 To build with TLS support, you'll need OpenSSL development libraries (e.g. libssl-dev on Debian/Ubuntu) and run:
@@ -95,6 +93,15 @@ To build with lua instead of luaJIT, run:
 
 ```shell
 $ ./x.py build -DENABLE_LUAJIT=OFF
+```
+
+Build with debug mode, run:
+
+```shell
+# The default build type is RelWithDebInfo and its optimization level is typically -O2.
+# You can change it to -O0 in debug mode.
+
+$ ./x.py build -DCMAKE_BUILD_TYPE=Debug
 ```
 
 ### Running Kvrocks
@@ -132,8 +139,8 @@ $ ./x.py test go # run Golang (unit and integration) test cases
 
 ### Supported platforms
 
-* Linux
-* macOS
+* OS: Linux and macOS
+* arch: x86_64, ARM and RISC-V
 
 ## Namespace
 
@@ -162,7 +169,7 @@ OK
 
 ## Cluster
 
-Kvrocks implements a proxyless centralized cluster solution but its accessing method is completely compatible with the Redis cluster client. You can use Redis cluster SDKs to access the kvrocks cluster. More details, please see: [Kvrocks Cluster Introduction](https://kvrocks.apache.org/docs/cluster/)
+Kvrocks implements a proxyless centralized cluster solution but its accessing method is completely compatible with Redis cluster clients. You can use Redis cluster SDKs to access the kvrocks cluster. For more details, please refer to [Kvrocks Cluster Introduction](https://kvrocks.apache.org/docs/cluster/).
 
 ## Documents
 
@@ -185,7 +192,7 @@ Kvrocks community welcomes all forms of contribution and you can find out how to
 
 ## License
 
-Apache Kvrocks is licensed under the Apache License Version 2.0. See the [LICENSE](LICENSE) file for details.
+Apache Kvrocks is licensed under the Apache License Version 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE) for details.
 
 ## Social Media
 

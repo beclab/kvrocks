@@ -118,17 +118,6 @@ func TestIntrospection(t *testing.T) {
 		require.Regexp(t, "id=.* addr=.*:.* fd=.* name=.* age=.* idle=.* flags=N namespace=.* qbuf=.* .*obuf=.* cmd=client.*", v)
 	})
 
-	t.Run("MONITOR can log executed commands", func(t *testing.T) {
-		c := srv.NewTCPClient()
-		defer func() { require.NoError(t, c.Close()) }()
-		require.NoError(t, c.WriteArgs("MONITOR"))
-		c.MustRead(t, "+OK")
-		require.NoError(t, rdb.Set(ctx, "foo", "bar", 0).Err())
-		require.NoError(t, rdb.Get(ctx, "foo").Err())
-		c.MustMatch(t, ".*set.*foo.*bar.*")
-		c.MustMatch(t, ".*get.*foo.*")
-	})
-
 	t.Run("CLIENT GETNAME should return NIL if name is not assigned", func(t *testing.T) {
 		require.EqualError(t, rdb.ClientGetName(ctx).Err(), redis.Nil.Error())
 	})
@@ -264,6 +253,40 @@ func TestIntrospection(t *testing.T) {
 		// key exist, always return 1
 		require.NoError(t, rdb.Do(ctx, "SET", "key", "value").Err())
 		require.EqualValues(t, 1, rdb.Do(ctx, "MOVE", "key", "0").Val())
+	})
+
+	// Test CLIENT REPLY subcommand behaviors
+	t.Run("CLIENT REPLY mode switching", func(t *testing.T) {
+		c := srv.NewTCPClient()
+		defer func() { require.NoError(t, c.Close()) }()
+
+		// Should reply by default
+		require.NoError(t, c.WriteArgs("ECHO", "default"))
+		c.MustReadBulkString(t, "default")
+
+		// Set to OFF, following commands should not reply
+		require.NoError(t, c.WriteArgs("CLIENT", "REPLY", "OFF"))
+		require.NoError(t, c.WriteArgs("ECHO", "off"))
+		// No reply expected here, do not read
+
+		// Set back to ON, commands should reply again
+		require.NoError(t, c.WriteArgs("CLIENT", "REPLY", "ON"))
+		c.MustRead(t, "+OK")
+		require.NoError(t, c.WriteArgs("ECHO", "on"))
+		c.MustReadBulkString(t, "on")
+
+		// Set to SKIP, next command should not reply, then reply resumes
+		require.NoError(t, c.WriteArgs("CLIENT", "REPLY", "SKIP"))
+		// No reply expected here, do not read
+
+		require.NoError(t, c.WriteArgs("ECHO", "skip1"))
+		// No reply expected here, do not read
+
+		require.NoError(t, c.WriteArgs("ECHO", "skip2"))
+		c.MustReadBulkString(t, "skip2")
+
+		require.NoError(t, c.WriteArgs("ECHO", "skip3"))
+		c.MustReadBulkString(t, "skip3")
 	})
 }
 

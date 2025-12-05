@@ -33,6 +33,7 @@
 #include <set>
 #include <shared_mutex>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -42,8 +43,12 @@
 #include "cluster/slot_import.h"
 #include "cluster/slot_migrate.h"
 #include "commands/commander.h"
+#include "common/time_util.h"
 #include "lua.hpp"
+#include "memory_profiler.h"
 #include "namespace.h"
+#include "search/index_manager.h"
+#include "search/indexer.h"
 #include "server/redis_connection.h"
 #include "stats/log_collector.h"
 #include "stats/stats.h"
@@ -53,7 +58,7 @@
 #include "tls_util.h"
 #include "worker.h"
 
-constexpr const char *REDIS_VERSION = "4.0.0";
+constexpr const char *REDIS_VERSION = "6.0.0";
 
 struct DBScanInfo {
   // Last scan system clock in seconds
@@ -198,6 +203,7 @@ class Server {
   void CleanupExitedSlaves();
   bool IsSlave() const { return !master_host_.empty(); }
   void FeedMonitorConns(redis::Connection *conn, const std::vector<std::string> &tokens);
+  static std::vector<std::string> RedactSensitiveTokens(const std::vector<std::string> &tokens);
   void IncrFetchFileThread() { fetch_file_threads_num_++; }
   void DecrFetchFileThread() { fetch_file_threads_num_--; }
   int GetFetchFileThreadNum() const { return fetch_file_threads_num_; }
@@ -225,32 +231,67 @@ class Server {
   void WakeupBlockingConns(const std::string &key, size_t n_conns);
   void OnEntryAddedToStream(const std::string &ns, const std::string &key, const redis::StreamEntryID &entry_id);
 
+  // WAIT command infrastructure
+  void BlockOnWait(redis::Connection *conn, rocksdb::SequenceNumber target_seq, uint64_t num_replicas);
+  void WakeupWaitConnections(rocksdb::SequenceNumber seq);
+  void CleanupWaitConnection(redis::Connection *conn);
+  void WakeupWaitConnection(redis::Connection *conn, rocksdb::SequenceNumber seq);
+
+  // Helper methods for WAIT command
+  size_t GetReplicasReachedSequence(rocksdb::SequenceNumber target_seq);
+  // Return the largest wait_context.target_seq that can wakeup given the seq.
+  // If no wait_context can wakeup, return 0.
+  rocksdb::SequenceNumber LargestTargetSeqToWakeup(rocksdb::SequenceNumber seq);
+
+  size_t GetReplicaCount() {
+    std::shared_lock<std::shared_mutex> guard(slave_threads_mu_);
+    return slave_threads_.size();
+  }
+
   std::string GetLastRandomKeyCursor();
   void SetLastRandomKeyCursor(const std::string &cursor);
 
   static int64_t GetCachedUnixTime();
   int64_t GetLastBgsaveTime();
-  void GetStatsInfo(std::string *info);
-  void GetServerInfo(std::string *info);
-  void GetMemoryInfo(std::string *info);
-  void GetRocksDBInfo(std::string *info);
-  void GetClientsInfo(std::string *info);
-  void GetReplicationInfo(std::string *info);
-  void GetRoleInfo(std::string *info);
-  void GetCommandsStatsInfo(std::string *info);
-  void GetClusterInfo(std::string *info);
-  void GetInfo(const std::string &ns, const std::string &section, std::string *info);
+  std::string GetRoleInfo();
+
+  struct InfoEntry {
+    std::string name;
+    std::string val;
+
+    InfoEntry(std::string name, std::string val) : name(std::move(name)), val(std::move(val)) {}
+    InfoEntry(std::string name, std::string_view val) : name(std::move(name)), val(val.begin(), val.end()) {}
+    InfoEntry(std::string name, const char *val) : name(std::move(name)), val(val) {}
+    template <typename T, std::enable_if_t<std::is_integral_v<T> || std::is_floating_point_v<T>, int> = 0>
+    InfoEntry(std::string name, T v) : name(std::move(name)), val(std::to_string(v)) {}
+  };
+  using InfoEntries = std::vector<InfoEntry>;
+
+  InfoEntries GetStatsInfo();
+  InfoEntries GetServerInfo();
+  InfoEntries GetMemoryInfo();
+  InfoEntries GetRocksDBInfo();
+  InfoEntries GetClientsInfo();
+  InfoEntries GetReplicationInfo();
+  InfoEntries GetCommandsStatsInfo();
+  InfoEntries GetClusterInfo();
+  InfoEntries GetPersistenceInfo();
+  InfoEntries GetCpuInfo();
+  InfoEntries GetKeyspaceInfo(const std::string &ns);
+
+  std::string GetInfo(const std::string &ns, const std::vector<std::string> &sections);
   std::string GetRocksDBStatsJson() const;
   ReplState GetReplicationState();
 
-  void PrepareRestoreDB();
+  bool PrepareRestoreDB();
   void WaitNoMigrateProcessing();
   Status AsyncCompactDB(const std::string &begin_key = "", const std::string &end_key = "");
   Status AsyncBgSaveDB();
   Status AsyncPurgeOldBackups(uint32_t num_backups_to_keep, uint32_t backup_max_keep_hours);
   Status AsyncScanDBSize(const std::string &ns);
   void GetLatestKeyNumStats(const std::string &ns, KeyNumStats *stats);
-  int64_t GetLastScanTime(const std::string &ns) const;
+  int64_t GetLastScanTime(const std::string &ns);
+  StatusOr<std::vector<rocksdb::BatchResult>> PollUpdates(uint64_t next_sequence, int64_t count, bool is_strict) const;
 
   std::string GenerateCursorFromKeyName(const std::string &key_name, CursorType cursor_type, const char *prefix = "");
   std::string GetKeyNameFromCursor(const std::string &cursor, CursorType cursor_type);
@@ -266,8 +307,7 @@ class Server {
   void KillClient(int64_t *killed, const std::string &addr, uint64_t id, uint64_t type, bool skipme,
                   redis::Connection *conn);
 
-  lua_State *Lua() { return lua_; }
-  Status ScriptExists(const std::string &sha);
+  Status ScriptExists(const std::string &sha) const;
   Status ScriptGet(const std::string &sha, std::string *body) const;
   Status ScriptSet(const std::string &sha, const std::string &body) const;
   void ScriptReset();
@@ -280,10 +320,6 @@ class Server {
 
   Status Propagate(const std::string &channel, const std::vector<std::string> &tokens) const;
   Status ExecPropagatedCommand(const std::vector<std::string> &tokens);
-  Status ExecPropagateScriptCommand(const std::vector<std::string> &tokens);
-
-  void SetCurrentConnection(redis::Connection *conn) { curr_connection_ = conn; }
-  redis::Connection *GetCurrentConnection() { return curr_connection_; }
 
   LogCollector<PerfEntry> *GetPerfLog() { return &perf_log_; }
   LogCollector<SlowEntry> *GetSlowLog() { return &slow_log_; }
@@ -294,6 +330,7 @@ class Server {
 
   Stats stats;
   engine::Storage *storage;
+  MemoryProfiler memory_profiler;
   std::unique_ptr<Cluster> cluster;
   static inline std::atomic<int64_t> unix_time_secs = 0;
   std::unique_ptr<SlotMigrator> slot_migrator;
@@ -313,16 +350,22 @@ class Server {
   UniqueSSLContext ssl_ctx;
 #endif
 
+  // search
+  redis::GlobalIndexer indexer;
+  redis::IndexManager index_mgr;
+
  private:
   void cron();
   void recordInstantaneousMetrics();
   static void updateCachedTime();
-  Status autoResizeBlockAndSST();
   void updateWatchedKeysFromRange(const std::vector<std::string> &args, const redis::CommandKeyRange &range);
   void updateAllWatchedKeys();
   void increaseWorkerThreads(size_t delta);
   void decreaseWorkerThreads(size_t delta);
   void cleanupExitedWorkerThreads(bool force);
+  // Helper function to clean up wait contexts for a given connection
+  // It would not hold the wait_contexts_mu_ and the caller should hold it.
+  void cleanupWaitConnection(redis::Connection *conn);
 
   std::atomic<bool> stop_ = false;
   std::atomic<bool> is_loading_ = false;
@@ -334,10 +377,6 @@ class Server {
   std::string last_random_key_cursor_;
   std::mutex last_random_key_cursor_mu_;
 
-  std::atomic<lua_State *> lua_;
-
-  redis::Connection *curr_connection_ = nullptr;
-
   // client counters
   std::atomic<uint64_t> client_id_{1};
   std::atomic<int> connected_clients_{0};
@@ -345,7 +384,7 @@ class Server {
   std::atomic<uint64_t> total_clients_{0};
 
   // slave
-  std::mutex slave_threads_mu_;
+  std::shared_mutex slave_threads_mu_;
   std::list<std::unique_ptr<FeedSlaveThread>> slave_threads_;
   std::atomic<int> fetch_file_threads_num_ = 0;
 
@@ -377,6 +416,18 @@ class Server {
 
   std::mutex blocked_stream_consumers_mu_;
   std::map<std::string, std::set<std::shared_ptr<StreamConsumer>>> blocked_stream_consumers_;
+
+  // WAIT command blocking infrastructure
+  struct WaitContext {
+    redis::Connection *conn;
+    rocksdb::SequenceNumber target_seq;
+    uint64_t num_replicas;
+
+    WaitContext(redis::Connection *c, rocksdb::SequenceNumber seq, uint64_t replicas)
+        : conn(c), target_seq(seq), num_replicas(replicas) {}
+  };
+  std::multimap<rocksdb::SequenceNumber, WaitContext> wait_contexts_;
+  std::shared_mutex wait_contexts_mu_;
 
   // threads
   std::shared_mutex works_concurrency_rw_lock_;
