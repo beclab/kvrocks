@@ -116,7 +116,7 @@ class CommandXAdd : public Commander {
 
         size_t max_len_idx = 0;
         bool eq_sign_found = false;
-        if (args[i + 1] == "=") {
+        if (args[i + 1] == "=" || args[i + 1] == "~") {
           max_len_idx = i + 2;
           eq_sign_found = true;
         } else {
@@ -146,7 +146,7 @@ class CommandXAdd : public Commander {
 
         size_t min_id_idx = 0;
         bool eq_sign_found = false;
-        if (args[i + 1] == "=") {
+        if (args[i + 1] == "=" || args[i + 1] == "~") {
           min_id_idx = i + 2;
           eq_sign_found = true;
         } else {
@@ -1739,7 +1739,7 @@ class CommandXTrim : public Commander {
       strategy_ = StreamTrimStrategy::MaxLen;
 
       size_t max_len_idx = 0;
-      if (args[3] != "=") {
+      if (args[3] != "=" && args[3] != "~") {
         max_len_idx = 3;
       } else {
         max_len_idx = 4;
@@ -1760,7 +1760,7 @@ class CommandXTrim : public Commander {
       strategy_ = StreamTrimStrategy::MinID;
 
       size_t min_id_idx = 0;
-      if (args[3] != "=") {
+      if (args[3] != "=" && args[3] != "~") {
         min_id_idx = 3;
       } else {
         min_id_idx = 4;
