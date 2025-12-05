@@ -163,6 +163,7 @@ Config::Config() {
       {"tls-session-cache-timeout", false, new IntField(&tls_session_cache_timeout, 300, 0, INT_MAX)},
       {"tls-replication", true, new YesNoField(&tls_replication, false)},
 #endif
+      {"databases", false, new IntField(&databases, 1, 1, 1)},
       {"workers", false, new IntField(&workers, 8, 1, 256)},
       {"timeout", false, new IntField(&timeout, 0, 0, INT_MAX)},
       {"tcp-backlog", true, new IntField(&backlog, 511, 0, INT_MAX)},

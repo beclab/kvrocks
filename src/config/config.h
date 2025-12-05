@@ -106,6 +106,7 @@ struct Config {
 
   int workers = 0;
   int timeout = 0;
+  int databases = 1;
   spdlog::level::level_enum log_level = spdlog::level::info;
   int backlog = 511;
   int maxclients = 10000;
