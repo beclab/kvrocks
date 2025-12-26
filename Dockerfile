@@ -37,7 +37,7 @@ RUN mkdir /var/run/kvrocks /var/lib/kvrocks && \
     chown -R kvrocks:kvrocks /var/run/kvrocks /var/lib/kvrocks
 
 # Switch to the non-root user
-USER 999
+# USER 999
 
 VOLUME /var/lib/kvrocks
 
